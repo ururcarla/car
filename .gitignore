@@ -1,0 +1,10 @@
+__pycache__/roi_canvas_demo.cpython-312.pyc
+__pycache__/test_batch_roi.cpython-312.pyc
+/shelf/
+/workspace.xml
+*.pt
+*.csv
+*.onnx
+*.pyc
+*.png
+.jpg
