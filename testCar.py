@@ -35,7 +35,8 @@ camera_bp.set_attribute('fov', '90')
 camera_transforms = {
     'front': carla.Transform(carla.Location(x=2.0, z=1.4), carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0)),
     'left': carla.Transform(carla.Location(x=1.0, y=-0.8, z=2.2), carla.Rotation(yaw=-60)),
-    'right': carla.Transform(carla.Location(x=1.0, y=0.8, z=2.2), carla.Rotation(yaw=60))
+    'right': carla.Transform(carla.Location(x=1.0, y=0.8, z=2.2), carla.Rotation(yaw=60)),
+    'rear': carla.Transform(carla.Location(x=-1.0, z=1.4), carla.Rotation(yaw=180))
 }
 
 # 用于保存图像数据
@@ -88,6 +89,17 @@ roi_demo = ROICanvasDemo(cam_names, img_size=(640, 480))
 
 roi_demo.model = model
 roi_demo.trackers = trackers
+
+# 打印配置信息
+from roi_canvas_demo import USE_BATCH_PROCESSING, ROI_BATCH_SIZE, MAX_BATCH_SIZE, USE_BEV_FUSION, NUM_CAMERAS, BEV_DISTANCE_THRESHOLD
+print(f"=== 多摄像头ROI处理配置 ===")
+print(f"摄像头数量: {NUM_CAMERAS}")
+print(f"ROI批量处理模式: {'启用' if USE_BATCH_PROCESSING else '禁用'}")
+print(f"ROI批量大小: {ROI_BATCH_SIZE}x{ROI_BATCH_SIZE}")
+print(f"最大批次大小: {MAX_BATCH_SIZE}")
+print(f"BEV融合模式: {'启用' if USE_BEV_FUSION else '禁用'}")
+print(f"BEV距离阈值: {BEV_DISTANCE_THRESHOLD}m")
+print("================================")
 
 def process_image(frame, name):
     # 推理计时

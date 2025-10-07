@@ -10,6 +10,9 @@ from ultralytics import YOLO
 # Optional: import your SORT implementation
 from sort import Sort  # expects API: update(dets) -> [[x1,y1,x2,y2,track_id], ...]
 
+# BEV和多摄像头融合
+from bev_transform import BEVTransformer, MultiCameraFusion, create_default_camera_params
+
 """
 ROI Canvas Demo (tracker-driven ROI selection + fixed-size canvas packing)
 -----------------------------------------------------------------------
@@ -36,6 +39,17 @@ ROI_PADDING = 16                # pixels padded around predicted ROI
 MAX_ROIS_PER_FRAME = 48         # safety cap across all cameras per frame
 CANVAS_W, CANVAS_H = 1024, 1024 # FIXED canvas size
 SHOW_WINDOWS = True             # set False if running headless
+
+# Batch processing configurations
+ROI_BATCH_SIZE = 320            # target size for ROI resizing (320x320)
+USE_BATCH_PROCESSING = True     # enable batch ROI processing
+MAX_BATCH_SIZE = 16             # maximum number of ROIs in one batch
+
+# Multi-camera fusion configurations
+USE_BEV_FUSION = True           # enable BEV-based multi-camera fusion
+NUM_CAMERAS = 4                 # number of cameras (front, left, right, rear)
+BEV_DISTANCE_THRESHOLD = 1.0    # ground distance threshold for fusion (meters)
+BEV_TIME_THRESHOLD = 0.3        # time difference threshold for fusion (seconds)
 
 # Limit classes to road-relevant targets (COCO ids)
 # person=0, car=2, motorcycle=3, bus=5, truck=7, traffic light=9
@@ -88,6 +102,149 @@ def expand_with_padding(x1, y1, x2, y2, pad, W, H):
 
 def is_keyframe(frame_index: int, k: int = KEYFRAME_INTERVAL) -> bool:
     return (frame_index % k) == 0
+
+
+def resize_roi_to_batch_size(roi: np.ndarray, target_size: int = ROI_BATCH_SIZE) -> np.ndarray:
+    """
+    将ROI调整到指定大小，保持长宽比并进行letterbox填充
+    """
+    if roi.size == 0:
+        return np.zeros((target_size, target_size, 3), dtype=np.uint8)
+    
+    h, w = roi.shape[:2]
+    
+    # 计算缩放比例，保持长宽比
+    scale = min(target_size / w, target_size / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    
+    # 调整大小
+    resized = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
+    # 创建目标大小的画布并居中放置
+    canvas = np.full((target_size, target_size, 3), 114, dtype=np.uint8)
+    
+    # 计算放置位置（居中）
+    x_offset = (target_size - new_w) // 2
+    y_offset = (target_size - new_h) // 2
+    
+    canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+    
+    return canvas
+
+
+def extract_rois_from_frames(frames: Dict[str, np.ndarray], roi_coords: List[Tuple[str, int, int, int, int]]) -> List[Tuple[str, np.ndarray, Tuple[int, int, int, int]]]:
+    """
+    从帧中提取ROI图像并调整到批量处理大小
+    roi_coords: list of (cam_name, x, y, w, h)
+    """
+    roi_items = []
+    
+    for cam_name, x, y, w, h in roi_coords:
+        if cam_name not in frames:
+            continue
+            
+        frame = frames[cam_name]
+        H, W = frame.shape[:2]
+        
+        # 确保坐标在有效范围内
+        x, y, w, h = clamp_rect(x, y, w, h, W, H)
+        
+        # 提取ROI
+        roi = frame[y:y + h, x:x + w]
+        
+        if roi.size > 0:
+            # 调整到批量处理大小
+            resized_roi = resize_roi_to_batch_size(roi, ROI_BATCH_SIZE)
+            roi_items.append((cam_name, resized_roi, (x, y, w, h)))
+    
+    return roi_items
+
+
+def batch_inference_rois(model: YOLO, roi_batch: List[np.ndarray]) -> List[np.ndarray]:
+    """
+    对ROI批次进行批量推理
+    """
+    if not roi_batch:
+        return []
+    
+    # 将ROI列表转换为numpy数组批次
+    batch_array = np.stack(roi_batch, axis=0)
+    
+    # 进行批量推理
+    results = model.predict(batch_array, verbose=False)
+    
+    # 提取检测结果
+    batch_detections = []
+    for result in results:
+        if result.boxes.shape[0] == 0:
+            batch_detections.append(np.empty((0, 6), dtype=np.float32))
+        else:
+            xyxy = result.boxes.xyxy.cpu().numpy().astype(np.float32)
+            conf = result.boxes.conf.cpu().numpy().astype(np.float32).reshape(-1, 1)
+            cls = result.boxes.cls.cpu().numpy().astype(np.float32).reshape(-1, 1)
+            
+            # 过滤允许的类别
+            cls_i = cls.astype(np.int32).flatten()
+            keep = np.array([c in ALLOWED_CLS for c in cls_i], dtype=bool)
+            
+            if not keep.any():
+                batch_detections.append(np.empty((0, 6), dtype=np.float32))
+            else:
+                detections = np.hstack((xyxy[keep], conf[keep], cls[keep]))
+                batch_detections.append(detections)
+    
+    return batch_detections
+
+
+def remap_batch_detections_to_original(
+    batch_detections: List[np.ndarray], 
+    roi_items: List[Tuple[str, np.ndarray, Tuple[int, int, int, int]]]
+) -> Dict[str, np.ndarray]:
+    """
+    将批量推理结果映射回原始帧坐标
+    """
+    per_cam: Dict[str, List[List[float]]] = defaultdict(list)
+    
+    for i, (detections, (cam_name, resized_roi, (orig_x, orig_y, orig_w, orig_h))) in enumerate(zip(batch_detections, roi_items)):
+        if detections.size == 0:
+            continue
+            
+        # 获取调整大小前的原始ROI尺寸
+        orig_roi = roi_items[i][1]  # 原始ROI图像
+        orig_h, orig_w = orig_roi.shape[:2]
+        
+        # 计算缩放比例
+        scale_x = orig_w / ROI_BATCH_SIZE
+        scale_y = orig_h / ROI_BATCH_SIZE
+        
+        # 计算letterbox偏移（假设居中对齐）
+        pad_x = (ROI_BATCH_SIZE - orig_w * ROI_BATCH_SIZE / orig_w) / 2 if orig_w < orig_h else 0
+        pad_y = (ROI_BATCH_SIZE - orig_h * ROI_BATCH_SIZE / orig_h) / 2 if orig_h < orig_w else 0
+        
+        for detection in detections:
+            x1, y1, x2, y2, conf, cls_id = detection
+            
+            # 移除letterbox填充
+            x1_unpad = (x1 - pad_x) * scale_x
+            y1_unpad = (y1 - pad_y) * scale_y
+            x2_unpad = (x2 - pad_x) * scale_x
+            y2_unpad = (y2 - pad_y) * scale_y
+            
+            # 映射到原始帧坐标
+            orig_x1 = orig_x + x1_unpad
+            orig_y1 = orig_y + y1_unpad
+            orig_x2 = orig_x + x2_unpad
+            orig_y2 = orig_y + y2_unpad
+            
+            per_cam[cam_name].append([orig_x1, orig_y1, orig_x2, orig_y2, float(conf), float(cls_id)])
+    
+    # 转换为numpy数组
+    out: Dict[str, np.ndarray] = {}
+    for cam, lst in per_cam.items():
+        out[cam] = np.array(lst, dtype=np.float32) if lst else np.empty((0, 6), dtype=np.float32)
+    
+    return out
 
 # =============================
 # Fixed-size canvas packing (grid + letterbox)
@@ -232,6 +389,38 @@ class ROICanvasDemo:
         self.img_w, self.img_h = img_size
         # per camera, per track-id -> deque of last two centers for velocity
         self.track_hist: Dict[str, Dict[int, Deque[Tuple[float, float, int]]]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=2)))
+        
+        # BEV和多摄像头融合
+        self.use_bev_fusion = USE_BEV_FUSION
+        if self.use_bev_fusion:
+            self._init_bev_fusion(cam_names)
+        
+        # 时间戳记录
+        self.current_timestamp = time.time()
+
+    def _init_bev_fusion(self, cam_names: List[str]):
+        """初始化BEV融合组件"""
+        print(f"[BEV] 初始化多摄像头BEV融合，摄像头数量: {len(cam_names)}")
+        
+        # 创建相机参数（使用默认配置，实际应用中应该从标定文件加载）
+        camera_params = create_default_camera_params()
+        
+        # 只保留当前使用的摄像头参数
+        available_cameras = {name: camera_params[name] for name in cam_names 
+                           if name in camera_params}
+        
+        if len(available_cameras) != len(cam_names):
+            print(f"[BEV] 警告：部分摄像头参数缺失，可用: {list(available_cameras.keys())}")
+        
+        # 初始化BEV变换器和融合器
+        self.bev_transformer = BEVTransformer(available_cameras, ground_height=0.0)
+        self.multi_camera_fusion = MultiCameraFusion(
+            self.bev_transformer,
+            distance_threshold=BEV_DISTANCE_THRESHOLD,
+            time_threshold=BEV_TIME_THRESHOLD
+        )
+        
+        print(f"[BEV] BEV融合初始化完成")
 
     # -------------- Detection wrappers --------------
     def detect_full(self, frame: np.ndarray) -> np.ndarray:
@@ -325,6 +514,83 @@ class ROICanvasDemo:
             items.append((cam_name, frame, rect))
         return items
 
+    def process_batch_rois(self, frames: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        批量处理ROI：提取ROI -> 调整大小 -> 批量推理 -> 映射回原始坐标
+        """
+        # 获取预测的ROI坐标
+        roi_coords = []
+        for cam_name, frame in frames.items():
+            tracks = self.prev_tracks.get(cam_name, np.empty((0, 5), dtype=np.float32))
+            for trk in tracks:
+                x, y, w, h = self._predict_next_box(cam_name, trk)
+                roi_coords.append((cam_name, x, y, w, h))
+        
+        if not roi_coords:
+            return {name: np.empty((0, 6), dtype=np.float32) for name in frames.keys()}
+        
+        # 限制ROI数量
+        roi_coords = roi_coords[:MAX_BATCH_SIZE]
+        
+        # 提取并调整ROI大小
+        roi_items = extract_rois_from_frames(frames, roi_coords)
+        
+        if not roi_items:
+            return {name: np.empty((0, 6), dtype=np.float32) for name in frames.keys()}
+        
+        # 可视化批量ROI
+        if SHOW_WINDOWS:
+            batch_vis = self._visualize_batch_rois(roi_items)
+            cv2.imshow('Batch ROIs', batch_vis)
+        
+        # 批量推理
+        roi_batch = [item[1] for item in roi_items]  # 提取调整后的ROI图像
+        batch_detections = batch_inference_rois(self.model, roi_batch)
+        
+        # 映射回原始坐标
+        remapped_dets = remap_batch_detections_to_original(batch_detections, roi_items)
+        
+        # 更新跟踪器
+        for cam_name in frames.keys():
+            dets5 = remapped_dets.get(cam_name, np.empty((0, 6), dtype=np.float32))
+            dets5 = dets5[:, :5] if dets5.size > 0 else dets5  # SORT expects [x1,y1,x2,y2,score]
+            tracks = self.update_tracker(cam_name, dets5)
+            print(f"[BATCH {cam_name}] batch dets={dets5.shape[0]}, tracks={tracks.shape[0]}")
+        
+        return remapped_dets
+
+    def _visualize_batch_rois(self, roi_items: List[Tuple[str, np.ndarray, Tuple[int, int, int, int]]]) -> np.ndarray:
+        """
+        可视化批量ROI
+        """
+        if not roi_items:
+            return np.zeros((ROI_BATCH_SIZE, ROI_BATCH_SIZE, 3), dtype=np.uint8)
+        
+        # 创建网格布局
+        n = len(roi_items)
+        cols = int(np.ceil(np.sqrt(n)))
+        rows = int(np.ceil(n / cols))
+        
+        vis_w = cols * ROI_BATCH_SIZE
+        vis_h = rows * ROI_BATCH_SIZE
+        vis_canvas = np.zeros((vis_h, vis_w, 3), dtype=np.uint8)
+        
+        for i, (cam_name, roi_img, _) in enumerate(roi_items):
+            row = i // cols
+            col = i % cols
+            
+            y_start = row * ROI_BATCH_SIZE
+            x_start = col * ROI_BATCH_SIZE
+            
+            vis_canvas[y_start:y_start + ROI_BATCH_SIZE, x_start:x_start + ROI_BATCH_SIZE] = roi_img
+            
+            # 添加标签
+            cv2.putText(vis_canvas, f"{i}:{cam_name}", 
+                       (x_start + 5, y_start + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return vis_canvas
+
     # -------------- Main steps --------------
     def process_keyframe(self, frames: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         per_cam_dets: Dict[str, np.ndarray] = {}
@@ -346,6 +612,16 @@ class ROICanvasDemo:
         return per_cam_dets
 
     def process_intermediate(self, frames: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        # 选择处理方式：批量处理或画布处理
+        if USE_BATCH_PROCESSING:
+            return self.process_batch_rois(frames)
+        else:
+            return self.process_intermediate_canvas(frames)
+
+    def process_intermediate_canvas(self, frames: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        原始的画布处理方法（保持向后兼容）
+        """
         # build predicted ROIs from trackers (all cams), prioritize, cap to K
         roi_items = self.build_roi_items(frames)
         if not roi_items:
@@ -392,10 +668,125 @@ class ROICanvasDemo:
 
     def step(self, frames: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         self.frame_index += 1
+        self.current_timestamp = time.time()
+        
         if is_keyframe(self.frame_index, KEYFRAME_INTERVAL):
-            return self.process_keyframe(frames)
+            results = self.process_keyframe(frames)
         else:
-            return self.process_intermediate(frames)
+            results = self.process_intermediate(frames)
+        
+        # BEV多摄像头融合
+        if self.use_bev_fusion and len(frames) > 1:
+            results = self.process_bev_fusion(results, frames)
+        
+        return results
+
+    def process_bev_fusion(self, detections_by_camera: Dict[str, np.ndarray], 
+                          frames: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        """
+        使用BEV变换进行多摄像头融合
+        """
+        try:
+            # 使用多摄像头融合器
+            fused_results = self.multi_camera_fusion.fuse_detections(
+                detections_by_camera, 
+                self.current_timestamp
+            )
+            
+            # 统计融合效果
+            total_detections_before = sum(dets.shape[0] for dets in detections_by_camera.values())
+            total_detections_after = sum(dets.shape[0] for dets in fused_results.values())
+            
+            print(f"[BEV] 融合前总检测数: {total_detections_before}, 融合后: {total_detections_after}")
+            
+            # 可视化BEV融合结果
+            if SHOW_WINDOWS:
+                self._visualize_bev_fusion(fused_results, frames)
+            
+            return fused_results
+            
+        except Exception as e:
+            print(f"[BEV] 融合失败，使用原始结果: {e}")
+            return detections_by_camera
+
+    def _visualize_bev_fusion(self, fused_results: Dict[str, np.ndarray], 
+                             frames: Dict[str, np.ndarray]):
+        """
+        可视化BEV融合结果
+        """
+        # 创建BEV鸟瞰图可视化
+        bev_size = 800
+        bev_canvas = np.zeros((bev_size, bev_size, 3), dtype=np.uint8)
+        
+        # 绘制地面网格
+        grid_size = 50
+        for i in range(0, bev_size, grid_size):
+            cv2.line(bev_canvas, (i, 0), (i, bev_size), (50, 50, 50), 1)
+            cv2.line(bev_canvas, (0, i), (bev_size, i), (50, 50, 50), 1)
+        
+        # 绘制坐标轴
+        center = bev_size // 2
+        cv2.arrowedLine(bev_canvas, (center, center), (center + 100, center), (0, 255, 0), 2)  # X轴
+        cv2.arrowedLine(bev_canvas, (center, center), (center, center - 100), (255, 0, 0), 2)  # Y轴
+        cv2.putText(bev_canvas, "X", (center + 110, center + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(bev_canvas, "Y", (center + 10, center - 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        
+        # 映射地面坐标到BEV图像
+        scale = 20  # 像素/米
+        
+        # 为每个摄像头使用不同颜色
+        colors = {
+            'front': (255, 255, 0),   # 黄色
+            'left': (255, 0, 255),    # 品红
+            'right': (0, 255, 255),   # 青色
+            'rear': (255, 128, 0)     # 橙色
+        }
+        
+        for cam_name, detections in fused_results.items():
+            if detections.size == 0:
+                continue
+            
+            color = colors.get(cam_name, (255, 255, 255))
+            
+            # 获取地面坐标
+            ground_points = self.bev_transformer.get_bottom_center_ground(cam_name, detections)
+            
+            for i, (detection, ground_point) in enumerate(zip(detections, ground_points)):
+                # 转换到BEV图像坐标
+                x, y = ground_point[0], ground_point[1]
+                bev_x = int(center + x * scale)
+                bev_y = int(center - y * scale)  # Y轴翻转
+                
+                # 确保在图像范围内
+                if 0 <= bev_x < bev_size and 0 <= bev_y < bev_size:
+                    # 绘制检测点
+                    cv2.circle(bev_canvas, (bev_x, bev_y), 5, color, -1)
+                    
+                    # 绘制置信度
+                    conf = detection[4]
+                    cv2.putText(bev_canvas, f"{conf:.2f}", 
+                               (bev_x + 8, bev_y - 8), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        
+        # 显示BEV图像
+        cv2.imshow('BEV Fusion View', bev_canvas)
+        
+        # 在原始图像上绘制融合后的检测结果
+        for cam_name, frame in frames.items():
+            if cam_name not in fused_results:
+                continue
+                
+            vis_frame = frame.copy()
+            detections = fused_results[cam_name]
+            
+            for detection in detections:
+                x1, y1, x2, y2, conf, cls_id = detection
+                cv2.rectangle(vis_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                cv2.putText(vis_frame, f'BEV-{conf:.2f}', 
+                           (int(x1), max(0, int(y1) - 6)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            cv2.imshow(f'BEV-{cam_name}', vis_frame)
 
 # =============================
 # Minimal dry-run (black frames)
