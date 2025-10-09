@@ -56,8 +56,8 @@ DEBUG_MODE = True               # enable debug output
 FALLBACK_TO_CANVAS = True       # fallback to canvas processing if batch fails
 
 # Limit classes to road-relevant targets (COCO ids)
-# person=0, car=2, motorcycle=3, bus=5, truck=7, traffic light=9
-ALLOWED_CLS = {0, 1, 2, 3, 5, 7, 9}
+# person=0, car=2, motorcycle=3, bus=5, truck=7, traffic light=9 (removed)
+ALLOWED_CLS = {0, 1, 2, 3, 5, 7}
 
 # =============================
 # Data structures
