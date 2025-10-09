@@ -42,7 +42,7 @@ SHOW_WINDOWS = True             # set False if running headless
 
 # Batch processing configurations
 ROI_BATCH_SIZE = 320            # target size for ROI resizing (320x320)
-USE_BATCH_PROCESSING = True     # enable batch ROI processing
+USE_BATCH_PROCESSING = False    # temporarily disable batch ROI processing due to OpenCV issues
 MAX_BATCH_SIZE = 16             # maximum number of ROIs in one batch
 
 # Multi-camera fusion configurations
@@ -50,6 +50,10 @@ USE_BEV_FUSION = True           # enable BEV-based multi-camera fusion
 NUM_CAMERAS = 4                 # number of cameras (front, left, right, rear)
 BEV_DISTANCE_THRESHOLD = 1.0    # ground distance threshold for fusion (meters)
 BEV_TIME_THRESHOLD = 0.3        # time difference threshold for fusion (seconds)
+
+# Debug configurations
+DEBUG_MODE = True               # enable debug output
+FALLBACK_TO_CANVAS = True       # fallback to canvas processing if batch fails
 
 # Limit classes to road-relevant targets (COCO ids)
 # person=0, car=2, motorcycle=3, bus=5, truck=7, traffic light=9
@@ -162,13 +166,37 @@ def extract_rois_from_frames(frames: Dict[str, np.ndarray], roi_coords: List[Tup
         # 确保坐标在有效范围内
         x, y, w, h = clamp_rect(x, y, w, h, W, H)
         
+        # 检查ROI尺寸是否有效
+        if w <= 0 or h <= 0:
+            print(f"[WARNING] 无效的ROI尺寸: {cam_name} ({x}, {y}, {w}, {h})")
+            continue
+        
         # 提取ROI
         roi = frame[y:y + h, x:x + w]
         
-        if roi.size > 0:
+        # 验证ROI是否有效
+        if roi.size == 0 or roi.shape[0] == 0 or roi.shape[1] == 0:
+            print(f"[WARNING] 提取的ROI为空: {cam_name} ({x}, {y}, {w}, {h})")
+            continue
+        
+        # 检查ROI是否包含有效数据
+        if np.all(roi == 0) or np.all(roi == 114):  # 全黑或全灰
+            print(f"[WARNING] ROI包含无效数据: {cam_name}")
+            continue
+        
+        try:
             # 调整到批量处理大小
             resized_roi = resize_roi_to_batch_size(roi, ROI_BATCH_SIZE)
-            roi_items.append((cam_name, resized_roi, (x, y, w, h)))
+            
+            # 验证调整后的ROI
+            if resized_roi.size > 0 and resized_roi.shape[0] > 0 and resized_roi.shape[1] > 0:
+                roi_items.append((cam_name, resized_roi, (x, y, w, h)))
+            else:
+                print(f"[WARNING] 调整后的ROI无效: {cam_name}")
+                
+        except Exception as e:
+            print(f"[WARNING] ROI调整失败: {cam_name}, 错误: {e}")
+            continue
     
     return roi_items
 
@@ -180,22 +208,65 @@ def batch_inference_rois(model: YOLO, roi_batch: List[np.ndarray]) -> List[np.nd
     if not roi_batch:
         return []
     
-    # 过滤掉空的ROI
+    # 严格过滤ROI
     valid_rois = []
     valid_indices = []
+    
     for i, roi in enumerate(roi_batch):
-        if roi.size > 0 and roi.shape[0] > 0 and roi.shape[1] > 0:
-            valid_rois.append(roi)
-            valid_indices.append(i)
+        # 检查ROI的基本属性
+        if roi is None:
+            print(f"[WARNING] ROI {i} 为 None")
+            continue
+            
+        if not isinstance(roi, np.ndarray):
+            print(f"[WARNING] ROI {i} 不是 numpy 数组")
+            continue
+            
+        if roi.size == 0:
+            print(f"[WARNING] ROI {i} 大小为 0")
+            continue
+            
+        if len(roi.shape) != 3:
+            print(f"[WARNING] ROI {i} 维度不正确: {roi.shape}")
+            continue
+            
+        if roi.shape[0] <= 0 or roi.shape[1] <= 0:
+            print(f"[WARNING] ROI {i} 尺寸无效: {roi.shape}")
+            continue
+            
+        if roi.shape[2] != 3:
+            print(f"[WARNING] ROI {i} 通道数不正确: {roi.shape}")
+            continue
+        
+        # 检查数据类型
+        if roi.dtype != np.uint8:
+            print(f"[WARNING] ROI {i} 数据类型不正确: {roi.dtype}")
+            continue
+        
+        # 检查是否有有效的像素值
+        if np.all(roi == 0) or np.all(roi == 114):
+            print(f"[WARNING] ROI {i} 包含无效像素值")
+            continue
+        
+        valid_rois.append(roi)
+        valid_indices.append(i)
+    
+    print(f"[BATCH] 有效ROI数量: {len(valid_rois)}/{len(roi_batch)}")
     
     if not valid_rois:
         return [np.empty((0, 6), dtype=np.float32) for _ in roi_batch]
     
-    # 将有效ROI列表转换为numpy数组批次
-    batch_array = np.stack(valid_rois, axis=0)
-    
-    # 进行批量推理
-    results = model.predict(batch_array, verbose=False)
+    try:
+        # 将有效ROI列表转换为numpy数组批次
+        batch_array = np.stack(valid_rois, axis=0)
+        print(f"[BATCH] 批次数组形状: {batch_array.shape}")
+        
+        # 进行批量推理
+        results = model.predict(batch_array, verbose=False)
+        
+    except Exception as e:
+        print(f"[ERROR] 批量推理失败: {e}")
+        return [np.empty((0, 6), dtype=np.float32) for _ in roi_batch]
     
     # 提取检测结果
     batch_detections = []
@@ -655,7 +726,15 @@ class ROICanvasDemo:
     def process_intermediate(self, frames: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         # 选择处理方式：批量处理或画布处理
         if USE_BATCH_PROCESSING:
-            return self.process_batch_rois(frames)
+            try:
+                return self.process_batch_rois(frames)
+            except Exception as e:
+                print(f"[ERROR] 批量处理失败: {e}")
+                if FALLBACK_TO_CANVAS:
+                    print("[FALLBACK] 回退到画布处理模式")
+                    return self.process_intermediate_canvas(frames)
+                else:
+                    raise e
         else:
             return self.process_intermediate_canvas(frames)
 
