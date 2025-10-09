@@ -40,6 +40,13 @@ MAX_ROIS_PER_FRAME = 48         # safety cap across all cameras per frame
 CANVAS_W, CANVAS_H = 1024, 1024 # FIXED canvas size
 SHOW_WINDOWS = True             # set False if running headless
 
+# Visualization toggles
+SHOW_KEYFRAME_WINDOWS = False      # show per-camera keyframe debug windows
+SHOW_ROI_CANVAS_WINDOW = False     # show packed ROI canvas window
+SHOW_BATCH_ROIS_WINDOW = True      # show Batch ROIs grid window
+SHOW_BEV_FUSION_VIEW = True        # show BEV Fusion View window
+SHOW_BEV_PER_CAMERA_WINDOWS = False# show per-camera fused windows
+
 # Batch processing configurations
 ROI_BATCH_SIZE = 320            # target size for ROI resizing (320x320)
 USE_BATCH_PROCESSING = False    # temporarily disable batch ROI processing due to OpenCV issues
@@ -651,7 +658,7 @@ class ROICanvasDemo:
             return {name: np.empty((0, 6), dtype=np.float32) for name in frames.keys()}
         
         # 可视化批量ROI
-        if SHOW_WINDOWS:
+        if SHOW_WINDOWS and SHOW_BATCH_ROIS_WINDOW:
             batch_vis = self._visualize_batch_rois(roi_items)
             cv2.imshow('Batch ROIs', batch_vis)
         
@@ -712,7 +719,7 @@ class ROICanvasDemo:
             print(f"[KEY {cam_name}] full detect {1000*(time.perf_counter()-t0):6.1f} ms, dets={dets.shape[0]}")
             tracks = self.update_tracker(cam_name, dets)
             # optional visualize
-            if SHOW_WINDOWS:
+            if SHOW_WINDOWS and SHOW_KEYFRAME_WINDOWS:
                 vis = frame.copy()
                 for x1, y1, x2, y2, s in dets:
                     cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), (0,255,0), 2)
@@ -749,7 +756,7 @@ class ROICanvasDemo:
 
         # pack into FIXED canvas
         canvas, mappings = pack_rois_fixed_canvas(roi_items, CANVAS_W, CANVAS_H)
-        if SHOW_WINDOWS:
+        if SHOW_WINDOWS and SHOW_ROI_CANVAS_WINDOW:
             canvas_vis = canvas.copy()
             # draw tile grid and labels
             for i, m in enumerate(mappings):
@@ -820,7 +827,7 @@ class ROICanvasDemo:
             print(f"[BEV] 融合前总检测数: {total_detections_before}, 融合后: {total_detections_after}")
             
             # 可视化BEV融合结果
-            if SHOW_WINDOWS:
+            if SHOW_WINDOWS and SHOW_BEV_FUSION_VIEW:
                 self._visualize_bev_fusion(fused_results, frames)
             
             return fused_results
@@ -888,8 +895,16 @@ class ROICanvasDemo:
                                (bev_x + 8, bev_y - 8), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         
+        # 添加相机图例
+        legend_y = 20
+        for name, color in colors.items():
+            cv2.circle(bev_canvas, (20, legend_y), 6, color, -1)
+            cv2.putText(bev_canvas, name, (35, legend_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            legend_y += 18
+
         # 显示BEV图像
-        cv2.imshow('BEV Fusion View', bev_canvas)
+        if SHOW_BEV_FUSION_VIEW:
+            cv2.imshow('BEV Fusion View', bev_canvas)
         
         # 在原始图像上绘制融合后的检测结果
         for cam_name, frame in frames.items():
@@ -914,7 +929,8 @@ class ROICanvasDemo:
                            (int(x1), max(0, int(y1) - 6)),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
-            cv2.imshow(f'BEV-{cam_name}', vis_frame)
+            if SHOW_BEV_PER_CAMERA_WINDOWS:
+                cv2.imshow(f'BEV-{cam_name}', vis_frame)
 
 # =============================
 # Minimal dry-run (black frames)
