@@ -290,20 +290,23 @@ class PerformanceTester:
                 print("  警告: 没有有效的ROI进行推理")
                 continue
             
-            # 使用 GPU 进行批量推理
-            batch_array = np.stack(valid_rois, axis=0)
-            results = self.demo.model.predict(batch_array, verbose=False, device=self.device)
+            # 使用 GPU 进行批量推理（传入列表，避免 OpenCV 在 letterbox 中对 4D 数组处理异常）
+            # 同时保留有效索引，确保输出与 roi_items 对齐
+            valid_indices = [i for i, roi in enumerate(roi_batch) if roi.size > 0 and roi.shape[0] > 0 and roi.shape[1] > 0]
+            results = self.demo.model.predict(valid_rois, verbose=False, device=self.device)
             
-            # 处理批量检测结果
-            batch_detections = []
-            for result in results:
+            # 处理批量检测结果，填充到与 roi_items 同长度的列表中
+            batch_detections = [np.empty((0, 6), dtype=np.float32) for _ in roi_batch]
+            for out_idx, result in enumerate(results):
                 if result.boxes.shape[0] == 0:
-                    batch_detections.append(np.empty((0, 6), dtype=np.float32))
+                    det = np.empty((0, 6), dtype=np.float32)
                 else:
                     xyxy = result.boxes.xyxy.cpu().numpy().astype(np.float32)
                     conf = result.boxes.conf.cpu().numpy().astype(np.float32).reshape(-1, 1)
                     cls = result.boxes.cls.cpu().numpy().astype(np.float32).reshape(-1, 1)
-                    batch_detections.append(np.hstack((xyxy, conf, cls)))
+                    det = np.hstack((xyxy, conf, cls))
+                orig_idx = valid_indices[out_idx]
+                batch_detections[orig_idx] = det
             
             inference_time = (time.perf_counter() - start) * 1000
             inference_times.append(inference_time)
