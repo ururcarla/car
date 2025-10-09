@@ -108,18 +108,26 @@ def resize_roi_to_batch_size(roi: np.ndarray, target_size: int = ROI_BATCH_SIZE)
     """
     将ROI调整到指定大小，保持长宽比并进行letterbox填充
     """
-    if roi.size == 0:
+    if roi.size == 0 or roi.shape[0] == 0 or roi.shape[1] == 0:
         return np.zeros((target_size, target_size, 3), dtype=np.uint8)
     
     h, w = roi.shape[:2]
     
+    # 确保尺寸有效
+    if w <= 0 or h <= 0:
+        return np.zeros((target_size, target_size, 3), dtype=np.uint8)
+    
     # 计算缩放比例，保持长宽比
     scale = min(target_size / w, target_size / h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
     
     # 调整大小
-    resized = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    try:
+        resized = cv2.resize(roi, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    except cv2.error as e:
+        print(f"[WARNING] ROI调整大小失败: {e}")
+        return np.zeros((target_size, target_size, 3), dtype=np.uint8)
     
     # 创建目标大小的画布并居中放置
     canvas = np.full((target_size, target_size, 3), 114, dtype=np.uint8)
@@ -127,6 +135,10 @@ def resize_roi_to_batch_size(roi: np.ndarray, target_size: int = ROI_BATCH_SIZE)
     # 计算放置位置（居中）
     x_offset = (target_size - new_w) // 2
     y_offset = (target_size - new_h) // 2
+    
+    # 确保索引在有效范围内
+    x_offset = max(0, min(x_offset, target_size - new_w))
+    y_offset = max(0, min(y_offset, target_size - new_h))
     
     canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
     
@@ -168,31 +180,52 @@ def batch_inference_rois(model: YOLO, roi_batch: List[np.ndarray]) -> List[np.nd
     if not roi_batch:
         return []
     
-    # 将ROI列表转换为numpy数组批次
-    batch_array = np.stack(roi_batch, axis=0)
+    # 过滤掉空的ROI
+    valid_rois = []
+    valid_indices = []
+    for i, roi in enumerate(roi_batch):
+        if roi.size > 0 and roi.shape[0] > 0 and roi.shape[1] > 0:
+            valid_rois.append(roi)
+            valid_indices.append(i)
+    
+    if not valid_rois:
+        return [np.empty((0, 6), dtype=np.float32) for _ in roi_batch]
+    
+    # 将有效ROI列表转换为numpy数组批次
+    batch_array = np.stack(valid_rois, axis=0)
     
     # 进行批量推理
     results = model.predict(batch_array, verbose=False)
     
     # 提取检测结果
     batch_detections = []
-    for result in results:
-        if result.boxes.shape[0] == 0:
+    result_idx = 0
+    
+    for i, roi in enumerate(roi_batch):
+        if i not in valid_indices:
+            # 对于无效的ROI，返回空检测结果
             batch_detections.append(np.empty((0, 6), dtype=np.float32))
         else:
-            xyxy = result.boxes.xyxy.cpu().numpy().astype(np.float32)
-            conf = result.boxes.conf.cpu().numpy().astype(np.float32).reshape(-1, 1)
-            cls = result.boxes.cls.cpu().numpy().astype(np.float32).reshape(-1, 1)
+            # 处理有效的ROI结果
+            result = results[result_idx]
+            result_idx += 1
             
-            # 过滤允许的类别
-            cls_i = cls.astype(np.int32).flatten()
-            keep = np.array([c in ALLOWED_CLS for c in cls_i], dtype=bool)
-            
-            if not keep.any():
+            if result.boxes.shape[0] == 0:
                 batch_detections.append(np.empty((0, 6), dtype=np.float32))
             else:
-                detections = np.hstack((xyxy[keep], conf[keep], cls[keep]))
-                batch_detections.append(detections)
+                xyxy = result.boxes.xyxy.cpu().numpy().astype(np.float32)
+                conf = result.boxes.conf.cpu().numpy().astype(np.float32).reshape(-1, 1)
+                cls = result.boxes.cls.cpu().numpy().astype(np.float32).reshape(-1, 1)
+                
+                # 过滤允许的类别
+                cls_i = cls.astype(np.int32).flatten()
+                keep = np.array([c in ALLOWED_CLS for c in cls_i], dtype=bool)
+                
+                if not keep.any():
+                    batch_detections.append(np.empty((0, 6), dtype=np.float32))
+                else:
+                    detections = np.hstack((xyxy[keep], conf[keep], cls[keep]))
+                    batch_detections.append(detections)
     
     return batch_detections
 
@@ -223,7 +256,15 @@ def remap_batch_detections_to_original(
         pad_y = (ROI_BATCH_SIZE - orig_h * ROI_BATCH_SIZE / orig_h) / 2 if orig_h < orig_w else 0
         
         for detection in detections:
-            x1, y1, x2, y2, conf, cls_id = detection
+            # 安全地解包检测结果，支持5个或6个值
+            if len(detection) == 6:
+                x1, y1, x2, y2, conf, cls_id = detection
+            elif len(detection) == 5:
+                x1, y1, x2, y2, conf = detection
+                cls_id = 0  # 默认类别
+            else:
+                print(f"[WARNING] 意外的检测结果格式，长度: {len(detection)}")
+                continue
             
             # 移除letterbox填充
             x1_unpad = (x1 - pad_x) * scale_x
@@ -780,7 +821,15 @@ class ROICanvasDemo:
             detections = fused_results[cam_name]
             
             for detection in detections:
-                x1, y1, x2, y2, conf, cls_id = detection
+                # 安全地解包检测结果
+                if len(detection) == 6:
+                    x1, y1, x2, y2, conf, cls_id = detection
+                elif len(detection) == 5:
+                    x1, y1, x2, y2, conf = detection
+                    cls_id = 0
+                else:
+                    continue
+                    
                 cv2.rectangle(vis_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
                 cv2.putText(vis_frame, f'BEV-{conf:.2f}', 
                            (int(x1), max(0, int(y1) - 6)),
