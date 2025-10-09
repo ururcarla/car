@@ -1,11 +1,37 @@
 #!/usr/bin/env python3
 """
 性能对比测试：打包ROI到大图推理 vs 批量推理ROI
+支持 GPU 推理和 KITTI 数据集
+
+使用方法:
+    1. 默认使用 GPU 和随机数据:
+       python performance_test.py
+    
+    2. 使用 GPU 和 KITTI 数据集:
+       python performance_test.py --kitti-path "C:/path/to/kitti/dataset"
+    
+    3. 强制使用 CPU:
+       python performance_test.py --cpu
+    
+    4. 使用随机数据（不使用 KITTI）:
+       python performance_test.py --no-kitti
+    
+    5. CPU + KITTI 数据集:
+       python performance_test.py --cpu --kitti-path "C:/path/to/kitti/dataset"
+
+参数说明:
+    --gpu         使用 GPU 进行推理（默认）
+    --cpu         强制使用 CPU 进行推理
+    --kitti-path  KITTI 数据集路径
+    --kitti-limit 限制加载的 KITTI 图像数量（默认: 16）
+    --no-kitti    不使用 KITTI 数据集，使用随机数据
 """
 import time
 import numpy as np
 import cv2
-from typing import Dict, List, Tuple
+import torch
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 from roi_canvas_demo import (
     ROICanvasDemo, 
     pack_rois_fixed_canvas, 
@@ -25,25 +51,106 @@ from roi_canvas_demo import (
 class PerformanceTester:
     """性能测试器"""
     
-    def __init__(self):
+    def __init__(self, use_gpu: bool = True, kitti_path: Optional[str] = None, kitti_limit: int = 16):
+        """
+        初始化性能测试器
+        
+        Args:
+            use_gpu: 是否使用 GPU 进行推理
+            kitti_path: KITTI 数据集路径（可选）
+        """
+        self.use_gpu = use_gpu
+        self.device = 0 if use_gpu and torch.cuda.is_available() else 'cpu'
+        self.kitti_path = Path(kitti_path) if kitti_path else None
+        self.kitti_limit = max(1, int(kitti_limit)) if kitti_path else 0
+        
+        # 检查 GPU 可用性
+        if use_gpu:
+            if torch.cuda.is_available():
+                print(f"✅ 使用 GPU: {torch.cuda.get_device_name(0)}")
+                print(f"   CUDA 版本: {torch.version.cuda}")
+                print(f"   显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+            else:
+                print("⚠️  GPU 不可用，将使用 CPU")
+                self.device = 'cpu'
+        else:
+            print("ℹ️  使用 CPU 模式")
+        
+        # 初始化演示对象
         self.demo = ROICanvasDemo(['front', 'left', 'right', 'rear'], img_size=(640, 480))
         
-    def create_test_data(self, num_rois: int = 8) -> Tuple[Dict[str, np.ndarray], List[Tuple[str, int, int, int, int]]]:
-        """创建测试数据"""
+        # 加载 KITTI 数据集（如果提供）
+        self.kitti_images = []
+        if self.kitti_path and self.kitti_path.exists():
+            self._load_kitti_dataset()
+    
+    def _load_kitti_dataset(self):
+        """加载 KITTI 数据集图像"""
+        print(f"\n📂 加载 KITTI 数据集: {self.kitti_path}")
+        
+        # 尝试多个可能的图像路径
+        possible_paths = [
+            self.kitti_path,
+            self.kitti_path / 'image_2',
+            self.kitti_path / 'training' / 'image_2',
+            self.kitti_path / 'valid',
+        ]
+        
+        for path in possible_paths:
+            if path.exists():
+                # 查找所有图像文件
+                image_files = list(path.glob('*.png')) + list(path.glob('*.jpg'))
+                if image_files:
+                    limit = self.kitti_limit if self.kitti_limit > 0 else 16
+                    self.kitti_images = sorted(image_files)[:limit]
+                    print(f"   ✅ 找到 {len(self.kitti_images)} 张图像")
+                    print(f"   路径: {path}")
+                    return
+        
+        print(f"   ⚠️  未找到 KITTI 图像，将使用随机测试数据")
+        
+    def create_test_data(self, num_rois: int = 8, use_kitti: bool = True) -> Tuple[Dict[str, np.ndarray], List[Tuple[str, int, int, int, int]]]:
+        """
+        创建测试数据
+        
+        Args:
+            num_rois: ROI 数量
+            use_kitti: 是否使用 KITTI 数据集（如果可用）
+        
+        Returns:
+            frames: 相机帧字典
+            roi_coords: ROI 坐标列表
+        """
         # 创建测试帧
         frames = {}
-        for cam_name in ['front', 'left', 'right', 'rear']:
-            # 创建随机测试图像
-            frame = np.random.randint(50, 200, (480, 640, 3), dtype=np.uint8)
-            # 添加一些纹理
-            for i in range(0, 480, 30):
-                cv2.line(frame, (0, i), (640, i), (100, 100, 100), 1)
-            frames[cam_name] = frame
+        cameras = ['front', 'left', 'right', 'rear']
+        
+        # 如果有 KITTI 数据集且选择使用，则加载真实图像
+        if use_kitti and self.kitti_images:
+            print(f"   使用 KITTI 数据集图像")
+            for i, cam_name in enumerate(cameras):
+                # 循环使用 KITTI 图像
+                img_idx = i % len(self.kitti_images)
+                img_path = self.kitti_images[img_idx]
+                frame = cv2.imread(str(img_path))
+                
+                if frame is not None:
+                    # 调整到目标大小
+                    frame = cv2.resize(frame, (640, 480))
+                    frames[cam_name] = frame
+                else:
+                    # 如果加载失败，使用随机数据
+                    frame = self._create_random_frame()
+                    frames[cam_name] = frame
+        else:
+            # 使用随机测试图像
+            print(f"   使用随机测试数据")
+            for cam_name in cameras:
+                frame = self._create_random_frame()
+                frames[cam_name] = frame
         
         # 创建模拟ROI坐标
         roi_coords = []
-        cameras = ['front', 'left', 'right', 'rear']
-        
         for i in range(num_rois):
             cam_name = cameras[i % len(cameras)]
             # 随机生成ROI坐标
@@ -54,6 +161,14 @@ class PerformanceTester:
             roi_coords.append((cam_name, x, y, w, h))
         
         return frames, roi_coords
+    
+    def _create_random_frame(self) -> np.ndarray:
+        """创建随机测试帧"""
+        frame = np.random.randint(50, 200, (480, 640, 3), dtype=np.uint8)
+        # 添加一些纹理
+        for i in range(0, 480, 30):
+            cv2.line(frame, (0, i), (640, i), (100, 100, 100), 1)
+        return frame
     
     def test_canvas_processing(self, frames: Dict[str, np.ndarray], 
                               roi_coords: List[Tuple[str, int, int, int, int]], 
@@ -85,9 +200,9 @@ class PerformanceTester:
             canvas_packing_time = (time.perf_counter() - start) * 1000
             canvas_packing_times.append(canvas_packing_time)
             
-            # 3. 画布推理
+            # 3. 画布推理（使用 GPU）
             start = time.perf_counter()
-            res = self.demo.model.predict(canvas, verbose=False)[0]
+            res = self.demo.model.predict(canvas, verbose=False, device=self.device)[0]
             inference_time = (time.perf_counter() - start) * 1000
             inference_times.append(inference_time)
             
@@ -161,7 +276,7 @@ class PerformanceTester:
                 print("  警告: 没有有效的ROI")
                 continue
             
-            # 2. 批量推理
+            # 2. 批量推理（使用 GPU）
             start = time.perf_counter()
             roi_batch = [item[1] for item in roi_items]
             
@@ -175,8 +290,21 @@ class PerformanceTester:
                 print("  警告: 没有有效的ROI进行推理")
                 continue
             
+            # 使用 GPU 进行批量推理
             batch_array = np.stack(valid_rois, axis=0)
-            batch_detections = batch_inference_rois(self.demo.model, roi_batch)
+            results = self.demo.model.predict(batch_array, verbose=False, device=self.device)
+            
+            # 处理批量检测结果
+            batch_detections = []
+            for result in results:
+                if result.boxes.shape[0] == 0:
+                    batch_detections.append(np.empty((0, 6), dtype=np.float32))
+                else:
+                    xyxy = result.boxes.xyxy.cpu().numpy().astype(np.float32)
+                    conf = result.boxes.conf.cpu().numpy().astype(np.float32).reshape(-1, 1)
+                    cls = result.boxes.cls.cpu().numpy().astype(np.float32).reshape(-1, 1)
+                    batch_detections.append(np.hstack((xyxy, conf, cls)))
+            
             inference_time = (time.perf_counter() - start) * 1000
             inference_times.append(inference_time)
             
@@ -271,8 +399,8 @@ class PerformanceTester:
         # 内存使用分析
         print(f"\n💾 内存使用分析:")
         canvas_memory = CANVAS_W * CANVAS_H * 3  # 画布大小
-        batch_memory = len(roi_coords) * ROI_BATCH_SIZE * ROI_BATCH_SIZE * 3  # 批量大小
-        print(f"  画布处理内存: {canvas_memory / 1024 / 1024:.2f} MB")
+        batch_memory = roi_count * ROI_BATCH_SIZE * ROI_BATCH_SIZE * 3  # 批量大小
+        print(f"  画布处理内存: {canvas_memory / 1024  / 1024:.2f} MB")
         print(f"  批量处理内存: {batch_memory / 1024 / 1024:.2f} MB")
         
         if batch_memory > canvas_memory:
@@ -280,10 +408,17 @@ class PerformanceTester:
         else:
             print(f"  画布处理使用更多内存 ({canvas_memory/batch_memory:.2f}x)")
     
-    def run_comprehensive_test(self):
-        """运行综合性能测试"""
+    def run_comprehensive_test(self, use_kitti: bool = True):
+        """
+        运行综合性能测试
+        
+        Args:
+            use_kitti: 是否使用 KITTI 数据集（如果可用）
+        """
         print("🚀 开始性能对比测试")
         print("="*60)
+        print(f"   设备: {'GPU' if self.device == 0 else 'CPU'}")
+        print(f"   数据源: {'KITTI 数据集' if use_kitti and self.kitti_images else '随机数据'}")
         
         # 测试不同的ROI数量
         roi_counts = [4, 8, 12, 16]
@@ -296,7 +431,7 @@ class PerformanceTester:
             print("-" * 40)
             
             # 创建测试数据
-            frames, roi_coords = self.create_test_data(roi_count)
+            frames, roi_coords = self.create_test_data(roi_count, use_kitti=use_kitti)
             
             # 测试画布处理
             canvas_stats = self.test_canvas_processing(frames, roi_coords, num_runs)
@@ -355,15 +490,36 @@ class PerformanceTester:
 
 def main():
     """主函数"""
+    import argparse
+    
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='ROI 处理性能对比测试 (支持 GPU 和 KITTI 数据集)')
+    parser.add_argument('--gpu', action='store_true', default=True, 
+                        help='使用 GPU 进行推理 (默认: True)')
+    parser.add_argument('--cpu', action='store_true', 
+                        help='强制使用 CPU 进行推理')
+    parser.add_argument('--kitti-path', type=str, default=None,
+                        help='KITTI 数据集路径 (可选)')
+    parser.add_argument('--kitti-limit', type=int, default=16,
+                        help='限制加载的 KITTI 图像数量 (默认: 16)')
+    parser.add_argument('--no-kitti', action='store_true',
+                        help='不使用 KITTI 数据集，使用随机数据')
+    
+    args = parser.parse_args()
+    
+    # 确定是否使用 GPU
+    use_gpu = args.gpu and not args.cpu
+    
     print("🎯 ROI处理性能对比测试")
     print("="*60)
     
     # 创建测试器
-    tester = PerformanceTester()
+    tester = PerformanceTester(use_gpu=use_gpu, kitti_path=args.kitti_path, kitti_limit=args.kitti_limit)
     
     try:
         # 运行综合测试
-        tester.run_comprehensive_test()
+        use_kitti = not args.no_kitti
+        tester.run_comprehensive_test(use_kitti=use_kitti)
         
     except Exception as e:
         print(f"❌ 测试过程中出现错误: {e}")
