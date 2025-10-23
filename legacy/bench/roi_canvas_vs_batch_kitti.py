@@ -431,7 +431,7 @@ def group_images_as_cameras(imgs: List[ImageROIs], group_size: int = 4) -> List[
 def classify_groups(groups: List[List[ImageROIs]], roi_threshold: int = 20) -> Tuple[List[List[ImageROIs]], List[List[ImageROIs]]]:
     few, many = [], []
     for g in groups:
-        total = sum(len(x.boxes_xyxy) for x in g)
+        total = sum(len(x.boxes_xyxyc) for x in g)
         if total >= roi_threshold:
             many.append(g)
         else:
