@@ -511,10 +511,7 @@ def run_bench_for_model(model_name: str,
                 infer_ms_sum += infer_ms
             canvas_infer_ms.append(infer_ms_sum)
             canvas_total_ms.append(infer_ms_sum + (t_pack1 - t_pack0) * 1000.0)
-            t_pack1 = time.perf_counter()
-            infer_ms, total_ms = time_predict_numpy(model, canvas, imgsz=imgsz)
-            canvas_infer_ms.append(infer_ms)
-            canvas_total_ms.append(infer_ms + (t_pack1 - t_pack0) * 1000.0)
+            # 已在上方统计所有画布推理时间 infer_ms_sum；不再重复计时
 
             # Batch
             t_pack0 = time.perf_counter()
@@ -564,15 +561,30 @@ def plot_results(records: List[BenchRecord], out_dir: Path, metric: str = "total
             by_model[r.model][r.method] = getattr(r, metric)
 
         models = sorted(by_model.keys())
-        canvas_vals = [by_model[m].get("canvas", float("nan")) for m in models]
-        batch_vals = [by_model[m].get("batch", float("nan")) for m in models]
+        # total 平均值
+        canvas_total = [by_model[m].get("canvas", float("nan")) for m in models]
+        batch_total = [by_model[m].get("batch", float("nan")) for m in models]
+        # 需要推理均值以拆分装箱与推理；到函数外部不可见，故再从 records 取 infer
+        infer_by_model = defaultdict(dict)
+        for r in rec_s:
+            if r.method == "canvas":
+                infer_by_model[r.model]["canvas_infer"] = r.infer_ms_mean
+            elif r.method == "batch":
+                infer_by_model[r.model]["batch_infer"] = r.infer_ms_mean
+        canvas_infer = [infer_by_model[m].get("canvas_infer", float("nan")) for m in models]
+        batch_infer = [infer_by_model[m].get("batch_infer", float("nan")) for m in models]
+        # 计算装箱时间 = total - infer（负值用0）
+        canvas_pack = [max(0.0, (canvas_total[i] - canvas_infer[i])) if not (np.isnan(canvas_total[i]) or np.isnan(canvas_infer[i])) else float("nan") for i in range(len(models))]
 
         x = np.arange(len(models))
         width = 0.35
 
         fig, ax = plt.subplots(figsize=(max(8, len(models) * 0.9), 5))
-        ax.bar(x - width / 2, canvas_vals, width, label="Canvas")
-        ax.bar(x + width / 2, batch_vals, width, label="Batch")
+        # 画布：堆叠显示 pack 和 infer
+        b1 = ax.bar(x - width / 2, canvas_pack, width, label="Canvas-Pack", color="#9ecae1")
+        b2 = ax.bar(x - width / 2, canvas_infer, width, bottom=canvas_pack, label="Canvas-Infer", color="#3182bd")
+        # 批次：仍显示总耗时（如需堆叠，可用 batch_total 与 (batch_total-batch_infer) 拆分）
+        ax.bar(x + width / 2, batch_total, width, label="Batch-Total", color="#fd8d3c")
         ax.set_ylabel("Latency (ms)")
         ax.set_title(f"{scenario.upper()} ROIs - {metric}")
         ax.set_xticks(x)
