@@ -76,7 +76,7 @@ ALLOWED_CLS = None            # 若限制类别，可设置为集合，如 {0,1,
 class ImageROIs:
     path: Path
     image: np.ndarray
-    boxes_xyxy: np.ndarray  # shape [N,4], float32
+    boxes_xyxyc: np.ndarray  # shape [N,5], float32, last is cls
 
 
 @dataclass
@@ -111,13 +111,15 @@ def yolov_full_detect(model: UL_YOLO, bgr: np.ndarray, imgsz: int = 640) -> np.n
     """
     res = model.predict(source=bgr, imgsz=imgsz, verbose=False, device=0)[0]
     if res.boxes.shape[0] == 0:
-        return np.empty((0, 4), dtype=np.float32)
+        return np.empty((0, 5), dtype=np.float32)
     xyxy = res.boxes.xyxy.cpu().numpy().astype(np.float32)
+    cls = res.boxes.cls.cpu().numpy().astype(np.float32).reshape(-1, 1)
     if ALLOWED_CLS is not None:
-        cls = res.boxes.cls.cpu().numpy().astype(np.int32)
-        keep = np.array([c in ALLOWED_CLS for c in cls], dtype=bool)
+        cls_i = cls.astype(np.int32).flatten()
+        keep = np.array([c in ALLOWED_CLS for c in cls_i], dtype=bool)
         xyxy = xyxy[keep]
-    return xyxy
+        cls = cls[keep]
+    return np.hstack([xyxy, cls])
 
 
 def clamp_rect(x: int, y: int, w: int, h: int, W: int, H: int) -> Tuple[int, int, int, int]:
@@ -197,6 +199,162 @@ def build_canvas_from_rois(frames: Dict[str, np.ndarray], rois: Dict[str, np.nda
     return canvas
 
 
+def _letterbox_into(dst: np.ndarray, src: np.ndarray) -> None:
+    """将 src 等比缩放后放入 dst 居中（dst 已创建好，背景114）。"""
+    dh, dw = dst.shape[:2]
+    sh, sw = src.shape[:2]
+    if sw == 0 or sh == 0 or dw == 0 or dh == 0:
+        return
+    s = min(dw / float(sw), dh / float(sh))
+    tw = max(1, int(round(sw * s)))
+    th = max(1, int(round(sh * s)))
+    resized = cv2.resize(src, (tw, th), interpolation=cv2.INTER_LINEAR)
+    px = (dw - tw) // 2
+    py = (dh - th) // 2
+    dst[py:py + th, px:px + tw] = resized
+
+
+def _danger_priority(cls_id: int) -> int:
+    """类别危险度优先级，数值越大优先级越高。
+    默认映射（Ultralytics COCO id）：
+      行人(0)、自行车(1)、摩托(3) -> 3
+      汽车(2)、公交(5)、卡车(7)     -> 2
+      其他                          -> 1
+    若无类别信息，返回 1。
+    """
+    if cls_id is None:
+        return 1
+    high = {0, 1, 3}
+    mid = {2, 5, 7}
+    if cls_id in high:
+        return 3
+    if cls_id in mid:
+        return 2
+    return 1
+
+def build_canvas_from_rois_guillotine(frames: Dict[str, np.ndarray], rois: Dict[str, np.ndarray], canvas_w: int, canvas_h: int) -> Tuple[np.ndarray, Dict[str, List[int]]]:
+    """
+    使用 Guillotine 二维装箱将多ROI按优先级放入单张画布。
+    策略：
+    - 先为每个ROI计算目标尺寸（保持比例，不放大），目标最长边约为 sqrt(canvas_area / n)。
+    - 将ROI按优先级（默认原始面积降序）排序，逐个放入空闲矩形列表F（初始为整个画布）。
+    - 选择第一个能容纳该ROI的空闲矩形，放在其左上角；若空闲矩形高>宽则水平分割，否则垂直分割；
+      生成两个新的空闲矩形并加入F；再删去被完全包含的冗余空闲矩形。
+    - 未能容纳的低优先级ROI丢弃。
+    """
+    # 收集所有 ROI 原始矩形
+    items: List[Tuple[str, int, Tuple[int, int, int, int], int]] = []  # (cam, idx, (x,y,w,h), cls)
+    for cam, boxes in rois.items():
+        H, W = frames[cam].shape[:2]
+        for idx, b in enumerate(boxes.astype(np.float32)):
+            if b.shape[0] >= 5:
+                x1, y1, x2, y2, clsf = b[:5].tolist()
+                cls_id = int(clsf)
+            else:
+                x1, y1, x2, y2 = b[:4].tolist()
+                cls_id = 0
+            x, y, w, h = clamp_rect(x1, y1, x2 - x1, y2 - y1, W, H)
+            if w <= 0 or h <= 0:
+                continue
+            items.append((cam, idx, (x, y, w, h), cls_id))
+
+    n = len(items)
+    canvas = np.full((canvas_h, canvas_w, 3), 114, dtype=np.uint8)
+    if n == 0:
+        return canvas
+
+    # 目标尺寸：使单个ROI最长边约为 sqrt(A/n)，避免极小tile
+    target_side = int(max(32, min(canvas_w, canvas_h, math.sqrt((canvas_w * canvas_h) / max(1, n)))))
+
+    # 计算优先级（默认按原始面积降序）；也保存目标尺寸
+    patches: List[Tuple[float, str, int, Tuple[int, int, int, int], int, int]] = []  # (prio, cam, idx, (x,y,w,h), tw, th)
+    for cam, idx, (x, y, w, h), cls_id in items:
+        # 危险度优先级：行人/骑行类最高，机动车次之，其它较低
+        # 可按需要调整映射
+        danger_rank = _danger_priority(cls_id)
+        prio = float(danger_rank * 1e9 + (w * h))
+        s = min(target_side / float(w), target_side / float(h), 1.0)
+        tw = max(1, int(w * s))
+        th = max(1, int(h * s))
+        patches.append((prio, cam, idx, (x, y, w, h), tw, th))
+
+    patches.sort(key=lambda t: t[0], reverse=True)
+
+    # 空闲矩形列表 F: (fx, fy, fw, fh)
+    F: List[Tuple[int, int, int, int]] = [(0, 0, canvas_w, canvas_h)]
+
+    # 记录放置结果：每个条目为 (cam, idx, src_rect(x,y,w,h), dst_rect(x,y,w,h))
+    placements: List[Tuple[str, int, Tuple[int, int, int, int], Tuple[int, int, int, int]]] = []
+
+    def prune_free_list(free_list: List[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
+        pruned: List[Tuple[int, int, int, int]] = []
+        for i, a in enumerate(free_list):
+            ax, ay, aw, ah = a
+            contained = False
+            for j, b in enumerate(free_list):
+                if i == j:
+                    continue
+                bx, by, bw, bh = b
+                if ax >= bx and ay >= by and ax + aw <= bx + bw and ay + ah <= by + bh:
+                    contained = True
+                    break
+            if not contained and aw > 0 and ah > 0:
+                pruned.append(a)
+        return pruned
+
+    for _, cam, idx, src_rect, tw, th in patches:
+        placed = False
+        for fi, (fx, fy, fw, fh) in enumerate(F):
+            if fw >= tw and fh >= th:
+                # 放在左上角
+                px, py = fx, fy
+                placements.append((cam, idx, src_rect, (px, py, tw, th)))
+
+                # 从该空闲矩形切分出两个新空闲矩形
+                del F[fi]
+                if fh > fw:
+                    # 水平分割：上方右侧+下方整宽
+                    right = (px + tw, py, fw - tw, th)
+                    below = (fx, fy + th, fw, fh - th)
+                    if right[2] > 0 and right[3] > 0:
+                        F.append(right)
+                    if below[2] > 0 and below[3] > 0:
+                        F.append(below)
+                else:
+                    # 垂直分割：右侧整高+下方等宽
+                    right = (fx + tw, fy, fw - tw, fh)
+                    below = (fx, fy + th, tw, fh - th)
+                    if right[2] > 0 and right[3] > 0:
+                        F.append(right)
+                    if below[2] > 0 and below[3] > 0:
+                        F.append(below)
+
+                # 清理被包含的空闲矩形
+                F = prune_free_list(F)
+                placed = True
+                break
+        # 放不下则跳过该低优先级补丁
+        if not placed:
+            continue
+
+    # 将放置结果渲染到画布
+    for cam, idx, (sx, sy, sw, sh), (dx, dy, dw, dh) in placements:
+        roi = frames[cam][sy:sy + sh, sx:sx + sw]
+        if roi.size == 0 or dw <= 0 or dh <= 0:
+            continue
+        tile = np.full((dh, dw, 3), 114, dtype=np.uint8)
+        _letterbox_into(tile, roi)
+        canvas[dy:dy + dh, dx:dx + dw] = tile
+
+    # 汇总已放置索引
+    placed_map: Dict[str, List[int]] = defaultdict(list)
+    for cam, idx, _, _ in placements:
+        placed_map[cam].append(idx)
+    for cam in placed_map:
+        placed_map[cam] = sorted(set(placed_map[cam]))
+
+    return canvas, placed_map
+
 def build_batch_from_rois(frames: Dict[str, np.ndarray], rois: Dict[str, np.ndarray]) -> np.ndarray:
     """
     生成小批次的ROI张量，形状 [B, H, W, 3]，uint8。
@@ -204,8 +362,8 @@ def build_batch_from_rois(frames: Dict[str, np.ndarray], rois: Dict[str, np.ndar
     batch: List[np.ndarray] = []
     for cam, boxes in rois.items():
         H, W = frames[cam].shape[:2]
-        for b in boxes.astype(np.int32):
-            x1, y1, x2, y2 = b.tolist()
+        for b in boxes.astype(np.float32):
+            x1, y1, x2, y2 = b[:4].tolist()
             x, y, w, h = clamp_rect(x1, y1, x2 - x1, y2 - y1, W, H)
             roi = frames[cam][y:y + h, x:x + w]
             if roi.size == 0:
@@ -258,8 +416,8 @@ def precompute_image_rois(img_paths: List[Path], count_model_path: str, imgsz: i
         bgr = cv2.imread(str(p))
         if bgr is None:
             continue
-        boxes = yolov_full_detect(count_model, bgr, imgsz=imgsz)
-        out[p] = ImageROIs(path=p, image=bgr, boxes_xyxy=boxes)
+        boxes_xyxyc = yolov_full_detect(count_model, bgr, imgsz=imgsz)
+        out[p] = ImageROIs(path=p, image=bgr, boxes_xyxyc=boxes_xyxyc)
     return out
 
 
@@ -288,7 +446,12 @@ def build_frames_and_rois(group: List[ImageROIs]) -> Tuple[Dict[str, np.ndarray]
     for i, item in enumerate(group):
         name = cam_names[i % len(cam_names)]
         frames[name] = item.image
-        rois[name] = item.boxes_xyxy.copy()
+        # 保留 xyxyc（包含类别），供优先级使用
+        boxes = item.boxes_xyxyc
+        if boxes is None or boxes.size == 0:
+            rois[name] = np.empty((0, 5), dtype=np.float32)
+        else:
+            rois[name] = boxes.astype(np.float32)
     return frames, rois
 
 
@@ -318,7 +481,36 @@ def run_bench_for_model(model_name: str,
 
             # Canvas
             t_pack0 = time.perf_counter()
-            canvas = build_canvas_from_rois(frames, rois, CANVAS_W, CANVAS_H)
+            # 使用 Guillotine 算法，放不下则新增画布继续，直到全部 ROI 放完
+            canvas_list: List[np.ndarray] = []
+            remaining_rois = {k: v.copy() for k, v in rois.items()}
+            while True:
+                # 结束条件：所有相机都没有剩余ROI
+                if all((arr is None or arr.size == 0) for arr in remaining_rois.values()):
+                    break
+                canvas, placed_map = build_canvas_from_rois_guillotine(frames, remaining_rois, CANVAS_W, CANVAS_H)
+                canvas_list.append(canvas)
+                # 从 remaining_rois 中移除已放置索引
+                for cam, idxs in placed_map.items():
+                    if cam not in remaining_rois:
+                        continue
+                    arr = remaining_rois[cam]
+                    if arr is None or arr.size == 0:
+                        continue
+                    mask = np.ones(arr.shape[0], dtype=bool)
+                    idxs = [i for i in idxs if 0 <= i < arr.shape[0]]
+                    mask[idxs] = False
+                    remaining = arr[mask]
+                    remaining_rois[cam] = remaining
+
+            t_pack1 = time.perf_counter()
+            # 对所有画布逐一推理并累计时间
+            infer_ms_sum = 0.0
+            for canvas in canvas_list:
+                infer_ms, _ = time_predict_numpy(model, canvas, imgsz=imgsz)
+                infer_ms_sum += infer_ms
+            canvas_infer_ms.append(infer_ms_sum)
+            canvas_total_ms.append(infer_ms_sum + (t_pack1 - t_pack0) * 1000.0)
             t_pack1 = time.perf_counter()
             infer_ms, total_ms = time_predict_numpy(model, canvas, imgsz=imgsz)
             canvas_infer_ms.append(infer_ms)
