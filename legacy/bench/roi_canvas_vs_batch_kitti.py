@@ -222,10 +222,18 @@ def time_predict_numpy(model: UL_YOLO, inp: np.ndarray, imgsz: int) -> Tuple[flo
     - infer_ms: 仅模型 .predict 的GPU同步后耗时
     - total_ms: 函数整体的耗时（此处与infer_ms几乎一致，保留以便扩展）
     """
+    # 将4D批次转换为列表以适配Ultralytics的letterbox预处理
+    source = inp
+    if isinstance(inp, np.ndarray) and inp.ndim == 4:
+        b = inp.shape[0]
+        if b == 0:
+            return 0.0, 0.0
+        source = [inp[i] for i in range(b)]
+
     if torch is not None and torch.cuda.is_available():
         torch.cuda.synchronize()
     t0 = time.perf_counter()
-    res = model.predict(source=inp, imgsz=imgsz, verbose=False, device=0)
+    res = model.predict(source=source, imgsz=imgsz, verbose=False, device=0)
     if torch is not None and torch.cuda.is_available():
         torch.cuda.synchronize()
     t1 = time.perf_counter()
