@@ -528,7 +528,8 @@ def evaluate_groups(
     few_groups: List[GroupBatch],
     many_groups: List[GroupBatch],
     out_vis_dir: Path,
-    vis_max: int
+    vis_max: int,
+    iou_thr: float
 ) -> List[AccRecord]:
     model = UL_YOLO(model_name)
     if torch is not None and torch.cuda.is_available():
@@ -556,8 +557,8 @@ def evaluate_groups(
                 gt = gts.get(cam, np.empty((0, 4), dtype=np.float32))
                 pc = pred_canvas.get(cam, np.empty((0, 6), dtype=np.float32))
                 pb = pred_batch.get(cam, np.empty((0, 6), dtype=np.float32))
-                tpc, fpc, fnc = match_detections_to_gts(pc, gt, IOU_THRESH)
-                tpb, fpb, fnb = match_detections_to_gts(pb, gt, IOU_THRESH)
+                tpc, fpc, fnc = match_detections_to_gts(pc, gt, iou_thr)
+                tpb, fpb, fnb = match_detections_to_gts(pb, gt, iou_thr)
                 tp_c += tpc; fp_c += fpc; fn_c += fnc
                 tp_b += tpb; fp_b += fpb; fn_b += fnb
                 # 可视化
@@ -641,7 +642,7 @@ def plot_metrics(records: List[AccRecord], out_dir: Path):
         ax.bar(x + width / 2, [by_model[m].get("batch", (np.nan, np.nan))[1] for m in models], width, label="Batch", color="#fdae6b")
         ax.set_ylabel("Recall@0.5"); ax.set_title(f"{scenario.upper()} ROIs - Recall")
         ax.set_xticks(x); ax.set_xticklabels(models, rotation=30, ha='right'); ax.legend(); ax.grid(True, axis='y', linestyle='--', alpha=0.4)
-        fig.tight_light = fig.tight_layout(); fig.savefig(out_dir / f"acc_{scenario}_recall.png", dpi=150); plt.close(fig)
+        fig.tight_layout(); fig.savefig(out_dir / f"acc_{scenario}_recall.png", dpi=150); plt.close(fig)
         # F1
         fig, ax = plt.subplots(figsize=(max(8, len(models) * 0.9), 4.2))
         ax.bar(x - width / 2, [by_model[m].get("canvas", (np.nan, np.nan, np.nan))[2] for m in models], width, label="Canvas", color="#08519c")
@@ -668,9 +669,8 @@ def main():
     ap.add_argument("--vis-max-per-model", type=int, default=VIS_MAX_PER_MODEL)
     args = ap.parse_args()
 
-    global GROUP_SIZE, FEW_MANY_THRESHOLD, IOU_THRESH
-    GROUP_SIZE = args.group_size
-    IOU_THRESH = args.iou_thr
+    group_size = args.group_size
+    iou_thr = args.iou_thr
 
     ensure_env()
 
@@ -678,8 +678,8 @@ def main():
     all_items = build_dataset_items(root, num_images=args.num_images, seed=args.seed)
     # 分组
     groups: List[GroupBatch] = []
-    for i in range(0, len(all_items) - GROUP_SIZE + 1, GROUP_SIZE):
-        groups.append(GroupBatch(images=all_items[i:i + GROUP_SIZE]))
+    for i in range(0, len(all_items) - group_size + 1, group_size):
+        groups.append(GroupBatch(images=all_items[i:i + group_size]))
     # 少/多ROI划分（以内含GT框数量为基准）
     few_groups: List[GroupBatch] = []
     many_groups: List[GroupBatch] = []
@@ -689,7 +689,7 @@ def main():
             many_groups.append(g)
         else:
             few_groups.append(g)
-    print(f"[prep] 分组完成: 少ROI={len(few_groups)}, 多ROI={len(many_groups)}, 组大小={GROUP_SIZE}")
+    print(f"[prep] 分组完成: 少ROI={len(few_groups)}, 多ROI={len(many_groups)}, 组大小={group_size}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -698,7 +698,7 @@ def main():
     for m in args.models:
         print(f"[eval] 模型 {m}: 少/多ROI 两种方法精度评测...")
         vis_dir = out_dir / f"vis_{Path(m).stem}"
-        recs = evaluate_groups(m, few_groups, many_groups, out_vis_dir=vis_dir, vis_max=args.vis_max_per_model)
+        recs = evaluate_groups(m, few_groups, many_groups, out_vis_dir=vis_dir, vis_max=args.vis_max_per_model, iou_thr=iou_thr)
         all_records.extend(recs)
 
     out_csv = out_dir / "roi_canvas_vs_batch_accuracy.csv"
