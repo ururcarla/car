@@ -457,9 +457,24 @@ def bytetrack_update(tracker: BYTETracker, dets: List[Box], img_wh: Tuple[int, i
 	else:
 		dets_np = np.array([[d.x1, d.y1, d.x2, d.y2, d.score] for d in dets], dtype=np.float32)
 	img_w, img_h = img_wh
-	output_tracks = tracker.update(dets_np, [img_h, img_w], [img_h, img_w])
-	# 返回: list of STrack（包含 tlbr 与 track_id）
-	return output_tracks
+
+	# 兼容 ultralytics 两种不同的 ByteTrack API：
+	# 1) update(results, img) 期望 Results 对象，读取 boxes.xyxy / boxes.conf
+	# 2) update(dets_np, img_info, img_size) 期望 Nx5 ndarray
+	try:
+		# 构造最小 Results/Boxes 适配器
+		boxes_obj = SimpleNamespace(
+			xyxy=torch.from_numpy(dets_np[:, :4] if dets_np.size else np.zeros((0, 4), dtype=np.float32)),
+			conf=torch.from_numpy(dets_np[:, 4] if dets_np.size else np.zeros((0,), dtype=np.float32)),
+		)
+		results_stub = SimpleNamespace(boxes=boxes_obj, orig_shape=(img_h, img_w))
+		dummy_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+		output_tracks = tracker.update([results_stub], dummy_img)  # type: ignore[arg-type]
+		return output_tracks
+	except Exception:
+		# 回退到旧接口（Nx5 + img_info + img_size）
+		output_tracks = tracker.update(dets_np, [img_h, img_w], [img_h, img_w])
+		return output_tracks
 
 
 # ==============================
