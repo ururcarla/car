@@ -653,6 +653,44 @@ def plot_results(records: List[BenchRecord], out_dir: Path, metric: str = "total
         plt.close(fig)
 
 
+def plot_extra_batch_ge(records: List[BenchRecord], out_dir: Path, metric: str = "total_ms_mean"):
+    """
+    为追加的 batch>=N 场景绘制单独图表：每个场景（few_geN / many_geN）一张图，
+    仅展示 Batch 方法的指标，避免影响原有两类场景图。
+    """
+    if plt is None:
+        return
+    # 收集扩展场景
+    scenarios = sorted(set([r.scenario for r in records if isinstance(r.scenario, str) and (r.scenario.startswith("few_ge") or r.scenario.startswith("many_ge"))]))
+    if not scenarios:
+        return
+    for scenario in scenarios:
+        rec_s = [r for r in records if r.scenario == scenario and r.method == "batch"]
+        if not rec_s:
+            continue
+        by_model = {}
+        for r in rec_s:
+            by_model[r.model] = getattr(r, metric)
+        models = sorted(by_model.keys())
+        values = [by_model[m] for m in models]
+
+        x = np.arange(len(models))
+        width = 0.6
+
+        fig, ax = plt.subplots(figsize=(max(8, len(models) * 0.9), 4.5))
+        ax.bar(x, values, width, label="Batch", color="#fd8d3c")
+        ax.set_ylabel("Latency (ms)" if "ms" in metric else metric)
+        ax.set_title(f"{scenario.upper()} - {metric}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(models, rotation=30, ha='right')
+        ax.legend()
+        ax.grid(True, axis='y', linestyle='--', alpha=0.4)
+        fig.tight_layout()
+        out_path = out_dir / f"bench_extra_{scenario}_{metric}.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+
+
 def write_csv(records: List[BenchRecord], out_csv: Path):
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
@@ -742,6 +780,9 @@ def main():
 
     plot_results(all_records, out_dir, metric="total_ms_mean")
     plot_results(all_records, out_dir, metric="infer_ms_mean")
+    # 为 batch>=N 扩展场景输出额外图表（若有）
+    plot_extra_batch_ge(all_records, out_dir, metric="total_ms_mean")
+    plot_extra_batch_ge(all_records, out_dir, metric="infer_ms_mean")
     print(f"[out] 图表输出到: {out_dir}")
 
 
