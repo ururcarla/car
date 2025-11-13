@@ -461,11 +461,14 @@ def map_coco_to_kitti(coco_name: str) -> Optional[str]:
 	return None
 
 
-def run_detect(model, image_bgr: np.ndarray) -> List[Box]:
+def run_detect(model, image_bgr: np.ndarray, imgsz: Optional[int] = None) -> List[Box]:
 	"""
 	对单张图像做检测，返回 Box 列表（坐标基于输入图像尺寸）。
 	"""
-	results = model.predict(source=image_bgr, verbose=False)
+	if imgsz is not None:
+		results = model.predict(source=image_bgr, imgsz=imgsz, verbose=False)
+	else:
+		results = model.predict(source=image_bgr, verbose=False)
 	boxes: List[Box] = []
 	if len(results) == 0:
 		return boxes
@@ -604,7 +607,9 @@ def run_pipeline(mode: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
 				)
 				t_build1 = time.time()
 				t_det0 = time.time()
-				canvas_dets = run_detect(model, canvas)
+				# 使用更小的 imgsz 等于 canvas 边长，确保实际以更小尺寸推理
+				canvas_edge = int(min(canvas_size[0], canvas_size[1]))
+				canvas_dets = run_detect(model, canvas, imgsz=canvas_edge)
 				t_det1 = time.time()
 				# 映射回原图
 				if len(canvas_dets) > 0:
