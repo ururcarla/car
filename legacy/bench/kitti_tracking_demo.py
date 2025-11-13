@@ -342,13 +342,14 @@ class GuillotinePacker:
 # Canvas 构建 & 坐标还原
 # ==============================
 def build_canvas_and_placements(image: np.ndarray, boxes: List[Box], pad: int, canvas_size: Tuple[int, int],
-                               allow_rotate: bool = False) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+                               allow_rotate: bool = False) -> Tuple[np.ndarray, List[Dict[str, Any]], Dict[str, float]]:
 	H, W = image.shape[:2]
 	ch = 3
 	cw, chh = int(canvas_size[0]), int(canvas_size[1])
 	canvas = np.zeros((chh, cw, 3), dtype=image.dtype)
 
 	# 预生成 patch（加 padding 并裁剪）
+	t_prepare0 = time.time()
 	patches = []
 	for b in boxes:
 		x1 = max(0, int(math.floor(b.x1)) - pad)
@@ -366,14 +367,22 @@ def build_canvas_and_placements(image: np.ndarray, boxes: List[Box], pad: int, c
 
 	# 大块优先装箱
 	patches.sort(key=lambda p: p["orig"][2] * p["orig"][3], reverse=True)
+	t_prepare1 = time.time()
+	prepare_ms = (t_prepare1 - t_prepare0) * 1000.0
+
 	packer = GuillotinePacker(cw, chh, allow_rotate=allow_rotate)
 	placements = []
+	packing_ms = 0.0
+	compose_ms = 0.0
 	for p in patches:
 		pw, ph = p["orig"][2], p["orig"][3]
 		# 若 patch 超 canvas，先整体等比缩放以尝试适配
 		scale_prefit = min(1.0, cw / max(1, pw), chh / max(1, ph))
 		tw, th = max(1, int(pw * scale_prefit)), max(1, int(ph * scale_prefit))
+		t_pack0 = time.time()
 		pos = packer.insert(tw, th)
+		t_pack1 = time.time()
+		packing_ms += (t_pack1 - t_pack0) * 1000.0
 		if pos is None:
 			continue
 		px, py, aw, ah = pos
@@ -381,15 +390,18 @@ def build_canvas_and_placements(image: np.ndarray, boxes: List[Box], pad: int, c
 		if (aw, ah) != (tw, th):
 			# 理论上不应发生；保守处理
 			tw, th = aw, ah
+		t_comp0 = time.time()
 		pimg = cv2.resize(p["img"], (tw, th), interpolation=cv2.INTER_LINEAR)
 		canvas[py:py + th, px:px + tw] = pimg
+		t_comp1 = time.time()
+		compose_ms += (t_comp1 - t_comp0) * 1000.0
 		placements.append({
 			"canvas_xywh": (px, py, tw, th),
 			"orig_xywh": p["orig"],  # 在原图中的 x1,y1,w,h
 			"scale": (tw / p["orig"][2], th / p["orig"][3]),
 		})
 
-	return canvas, placements
+	return canvas, placements, {"prepare_ms": prepare_ms, "packing_ms": packing_ms, "compose_ms": compose_ms}
 
 
 def remap_dets_from_canvas(dets_xyxy: np.ndarray, placements: List[Dict[str, Any]]) -> List[Box]:
@@ -545,6 +557,16 @@ def run_pipeline(mode: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
 	per_frame_obj_count: List[int] = []
 	total_frames = 0
 
+	# 系统模式详细时序（仅 system 填充）
+	sys_frame_times: List[Dict[str, Any]] = []
+	sys_time_full_det_ms: List[float] = []
+	sys_time_canvas_det_ms: List[float] = []
+	sys_time_prepare_ms: List[float] = []
+	sys_time_packing_ms: List[float] = []
+	sys_time_compose_ms: List[float] = []
+	sys_time_remap_ms: List[float] = []
+	sys_time_track_ms: List[float] = []
+
 	t0_total = time.time()
 
 	for seq in seqs:
@@ -565,28 +587,66 @@ def run_pipeline(mode: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
 			# 检测
 			if mode == "baseline" or (frame_idx % full_det_interval == 0) or (len(prev_dets) == 0):
 				# 全图检测
+				t_det0 = time.time()
 				curr_dets = run_detect(model, img)
+				t_det1 = time.time()
+				if mode == "system":
+					full_ms = (t_det1 - t_det0) * 1000.0
+					sys_time_full_det_ms.append(full_ms)
+					frame_rec: Dict[str, Any] = {"seq": seq_id, "frame": frame_idx, "type": "key", "full_det_ms": full_ms}
+				else:
+					frame_rec = {}
 			else:
 				# canvas patch 检测
-				canvas, placements = build_canvas_and_placements(
+				t_build0 = time.time()
+				canvas, placements, build_tm = build_canvas_and_placements(
 					img, prev_dets, pad=pad, canvas_size=canvas_size, allow_rotate=cfg["allow_rotate"]
 				)
+				t_build1 = time.time()
+				t_det0 = time.time()
 				canvas_dets = run_detect(model, canvas)
+				t_det1 = time.time()
 				# 映射回原图
 				if len(canvas_dets) > 0:
 					dets_np = np.array([[d.x1, d.y1, d.x2, d.y2, d.score] for d in canvas_dets], dtype=np.float32)
 				else:
 					dets_np = np.zeros((0, 5), dtype=np.float32)
+				t_remap0 = time.time()
 				mapped = remap_dets_from_canvas(dets_np, placements)
+				t_remap1 = time.time()
 				curr_dets = mapped
+
+				if mode == "system":
+					build_ms = (t_build1 - t_build0) * 1000.0
+					canvas_det_ms = (t_det1 - t_det0) * 1000.0
+					remap_ms = (t_remap1 - t_remap0) * 1000.0
+					sys_time_canvas_det_ms.append(canvas_det_ms)
+					sys_time_prepare_ms.append(build_tm.get("prepare_ms", 0.0))
+					sys_time_packing_ms.append(build_tm.get("packing_ms", 0.0))
+					sys_time_compose_ms.append(build_tm.get("compose_ms", 0.0))
+					sys_time_remap_ms.append(remap_ms)
+					frame_rec = {
+						"seq": seq_id, "frame": frame_idx, "type": "canvas",
+						"build_ms": build_ms, "prepare_ms": build_tm.get("prepare_ms", 0.0),
+						"packing_ms": build_tm.get("packing_ms", 0.0), "compose_ms": build_tm.get("compose_ms", 0.0),
+						"canvas_det_ms": canvas_det_ms, "remap_ms": remap_ms
+					}
 
 			# 跟踪（system 模式）
 			if tracker is not None:
 				try:
+					t_trk0 = time.time()
 					bytetrack_update(tracker, curr_dets, (W, H))
+					t_trk1 = time.time()
+					trk_ms = (t_trk1 - t_trk0) * 1000.0
+					sys_time_track_ms.append(trk_ms)
+					frame_rec["track_ms"] = trk_ms
 				except Exception as e:
 					if cfg["verbose"]:
 						print(f"[WARN] ByteTrack update failed at seq {seq_id} frame {frame_idx}: {e}")
+
+			if mode == "system":
+				sys_frame_times.append(frame_rec)
 
 			# 裁剪/清理坐标
 			for b in curr_dets:
@@ -625,6 +685,17 @@ def run_pipeline(mode: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
 		"total_time_s": total_time_s,
 		"per_frame_latency_ms": per_frame_latency_ms,
 		"per_frame_obj_count": per_frame_obj_count,
+		# 系统时序统计
+		"system_frame_times": sys_frame_times if mode == "system" else [],
+		"system_times_summary": {
+			"avg_full_det_ms": float(np.mean(sys_time_full_det_ms)) if len(sys_time_full_det_ms) else 0.0,
+			"avg_canvas_det_ms": float(np.mean(sys_time_canvas_det_ms)) if len(sys_time_canvas_det_ms) else 0.0,
+			"avg_prepare_ms": float(np.mean(sys_time_prepare_ms)) if len(sys_time_prepare_ms) else 0.0,
+			"avg_packing_ms": float(np.mean(sys_time_packing_ms)) if len(sys_time_packing_ms) else 0.0,
+			"avg_compose_ms": float(np.mean(sys_time_compose_ms)) if len(sys_time_compose_ms) else 0.0,
+			"avg_remap_ms": float(np.mean(sys_time_remap_ms)) if len(sys_time_remap_ms) else 0.0,
+			"avg_track_ms": float(np.mean(sys_time_track_ms)) if len(sys_time_track_ms) else 0.0,
+		} if mode == "system" else {},
 	}
 
 
@@ -647,6 +718,35 @@ def save_results(cfg: Dict[str, Any], baseline: Dict[str, Any], system: Dict[str
 					f"{res['avg_latency_ms']:.2f}", f"{res['fps']:.2f}",
 					res["total_frames"], f"{res['total_time_s']:.2f}"
 				])
+
+		# 系统模式详细时序
+		if system.get("system_times_summary"):
+			sys_sum_path = os.path.join(out_dir, "system_timing_summary.csv")
+			with open(sys_sum_path, "w", newline="") as f:
+				writer = csv.writer(f)
+				writer.writerow(["avg_full_det_ms", "avg_canvas_det_ms", "avg_prepare_ms", "avg_packing_ms", "avg_compose_ms", "avg_remap_ms", "avg_track_ms"])
+				s = system["system_times_summary"]
+				writer.writerow([
+					f"{s['avg_full_det_ms']:.3f}", f"{s['avg_canvas_det_ms']:.3f}", f"{s['avg_prepare_ms']:.3f}",
+					f"{s['avg_packing_ms']:.3f}", f"{s['avg_compose_ms']:.3f}", f"{s['avg_remap_ms']:.3f}", f"{s['avg_track_ms']:.3f}"
+				])
+			sys_frames_path = os.path.join(out_dir, "system_frame_times.csv")
+			with open(sys_frames_path, "w", newline="") as f:
+				writer = csv.writer(f)
+				writer.writerow(["seq", "frame", "type", "full_det_ms", "build_ms", "prepare_ms", "packing_ms", "compose_ms", "canvas_det_ms", "remap_ms", "track_ms", "total_frame_ms"])
+				for i, rec in enumerate(system.get("system_frame_times", [])):
+					writer.writerow([
+						rec.get("seq", ""), rec.get("frame", ""), rec.get("type", ""),
+						"%.3f" % rec.get("full_det_ms", 0.0) if "full_det_ms" in rec else "",
+						"%.3f" % rec.get("build_ms", 0.0) if "build_ms" in rec else "",
+						"%.3f" % rec.get("prepare_ms", 0.0) if "prepare_ms" in rec else "",
+						"%.3f" % rec.get("packing_ms", 0.0) if "packing_ms" in rec else "",
+						"%.3f" % rec.get("compose_ms", 0.0) if "compose_ms" in rec else "",
+						"%.3f" % rec.get("canvas_det_ms", 0.0) if "canvas_det_ms" in rec else "",
+						"%.3f" % rec.get("remap_ms", 0.0) if "remap_ms" in rec else "",
+						"%.3f" % rec.get("track_ms", 0.0) if "track_ms" in rec else "",
+						"%.3f" % (system["per_frame_latency_ms"][i] if i < len(system["per_frame_latency_ms"]) else 0.0)
+					])
 
 	# 图表
 	if cfg["save_plots"]:
