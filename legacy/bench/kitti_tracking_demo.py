@@ -75,7 +75,7 @@ CONFIG = {
 
 	# 系统策略
 	"full_det_interval": 5,  # 每 p 帧做一次全图检测
-	"canvas_size": (640, 640),
+	"canvas_size": (320, 320),
 	"patch_padding": 16,     # patch 四周扩展像素
 	"allow_rotate": False,   # canvas 装箱是否允许旋转（推荐 False）
 
