@@ -68,7 +68,7 @@ CONFIG = {
 
 	# 模型与推理
 	"device": "cuda:0" if torch.cuda.is_available() else "cpu",
-	"model_weights": "yolov8n.pt",
+	"model_weights": "yolov8m.pt",
 	"img_size": 640,        # YOLO 输入尺寸（方形）
 	"conf_thres": 0.25,
 	"iou_nms": 0.7,
