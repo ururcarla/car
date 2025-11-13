@@ -43,18 +43,15 @@ import matplotlib.pyplot as plt
 
 try:
 	from ultralytics import YOLO
-	from ultralytics.trackers.byte_tracker import BYTETracker
-	# 尝试导入官方 Results/Boxes 以最大兼容
-	try:
-		from ultralytics.yolo.engine.results import Results, Boxes  # type: ignore
-	except Exception:
-		Results, Boxes = None, None  # type: ignore
 except Exception as e:
 	YOLO = None
-	BYTETracker = None
-	Results, Boxes = None, None  # type: ignore
 	print("Warning: ultralytics not available. Please install `pip install ultralytics`. Error:", e)
 
+try:
+	import supervision as sv
+except Exception as e:
+	sv = None
+	print("Warning: supervision not available. Please install `pip install supervision`. Error:", e)
 
 # ==============================
 # 可调参数（集中管理）
@@ -441,65 +438,40 @@ def run_detect(model, image_bgr: np.ndarray) -> List[Box]:
 	return boxes
 
 
-def create_bytetracker(cfg: Dict[str, Any]) -> BYTETracker:
-	if BYTETracker is None:
-		raise RuntimeError("ultralytics not installed or tracker unavailable.")
-	args = SimpleNamespace(
+def create_bytetracker(cfg: Dict[str, Any]):
+	if sv is None:
+		raise RuntimeError("supervision not installed. Please `pip install supervision`.")
+	args = sv.ByteTrackArgs(
 		track_thresh=cfg.get("track_thresh", 0.5),
 		match_thresh=cfg.get("match_thresh", 0.8),
 		track_buffer=cfg.get("track_buffer", 30),
 		mot20=cfg.get("mot20", False),
+		# 使用默认 aspect_ratio_thresh 与 min_box_area
 	)
-	return BYTETracker(args, frame_rate=cfg.get("frame_rate", 30))
+	return sv.ByteTrack(args)
 
 
-def bytetrack_update(tracker: BYTETracker, dets: List[Box], img_wh: Tuple[int, int]):
+def bytetrack_update(tracker, dets: List[Box], img_wh: Tuple[int, int]):
 	"""
-	将 Box 列表转成 ByteTrack 接口所需的 dets: Nx5 [x1,y1,x2,y2,score]
-	返回在线轨迹列表（包含 tlbr 与 track_id）；此处结果仅用于可选的分析，不参与 AP 计算。
+	使用 supervision 的 ByteTrack：将 Box 列表转为 sv.Detections 并调用 update_with_detections。
 	"""
 	if len(dets) == 0:
-		dets_np = np.zeros((0, 5), dtype=np.float32)
+		xyxy = np.zeros((0, 4), dtype=np.float32)
+		conf = np.zeros((0,), dtype=np.float32)
 	else:
-		dets_np = np.array([[d.x1, d.y1, d.x2, d.y2, d.score] for d in dets], dtype=np.float32)
-	img_w, img_h = img_wh
+		xyxy = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32)
+		conf = np.array([d.score for d in dets], dtype=np.float32)
 
-	# 优先使用官方 Results/Boxes（ultralytics 新版 API），失败则回退到轻量适配，再不行使用旧 ndarray 接口
-	dummy_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+	if sv is None:
+		return []
 
-	# A) 官方 Results/Boxes
-	if 'Boxes' in globals() and Boxes is not None and 'Results' in globals() and Results is not None:
-		try:
-			if dets_np.size:
-				cls_col = np.zeros((dets_np.shape[0], 1), dtype=np.float32)  # 单类占位
-				data_np = np.concatenate([dets_np[:, :5], cls_col], axis=1)   # Nx6: xyxy+conf+cls
-			else:
-				data_np = np.zeros((0, 6), dtype=np.float32)
-			data_t = torch.from_numpy(data_np)
-			boxes_ultra = Boxes(data=data_t, orig_shape=(img_h, img_w))  # type: ignore[arg-type]
-			results_ultra = Results(orig_img=dummy_img, path=None, names=None, boxes=boxes_ultra)  # type: ignore[arg-type]
-			try:
-				return tracker.update(results_ultra, dummy_img)  # type: ignore[arg-type]
-			except Exception:
-				return tracker.update([results_ultra], dummy_img)  # type: ignore[arg-type]
-		except Exception:
-			pass
+	class_id = np.zeros((xyxy.shape[0],), dtype=int) if xyxy.shape[0] > 0 else np.zeros((0,), dtype=int)
+	detections = sv.Detections(xyxy=xyxy, confidence=conf, class_id=class_id)
 
-	# B) 轻量适配器（具备 boxes.xyxy/conf/cls）
 	try:
-		boxes_obj = SimpleNamespace(
-			xyxy=torch.from_numpy(dets_np[:, :4] if dets_np.size else np.zeros((0, 4), dtype=np.float32)),
-			conf=torch.from_numpy(dets_np[:, 4] if dets_np.size else np.zeros((0,), dtype=np.float32)),
-			cls=torch.zeros((dets_np.shape[0] if dets_np.size else 0,), dtype=torch.float32),
-		)
-		results_stub = SimpleNamespace(boxes=boxes_obj, orig_shape=(img_h, img_w))
-		try:
-			return tracker.update(results_stub, dummy_img)  # type: ignore[arg-type]
-		except Exception:
-			return tracker.update([results_stub], dummy_img)  # type: ignore[arg-type]
+		return tracker.update_with_detections(detections)
 	except Exception:
-		# C) 旧接口（Nx5 + img_info + img_size）
-		return tracker.update(dets_np, [img_h, img_w], [img_h, img_w])
+		return tracker.update(detections)
 
 
 # ==============================
