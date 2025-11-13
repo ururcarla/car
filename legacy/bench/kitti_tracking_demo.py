@@ -63,6 +63,8 @@ CONFIG = {
 	"split": "training",  # 'training' or 'testing'
 	# 指定序列列表；None 表示使用全部训练（或测试）序列
 	"sequences": None,  # 例: [0, 1, 2]
+	# 评测允许的 KITTI 类型（class-agnostic 但需排除 DontCare/Misc 等），可按需调整
+	"kitti_types": ["Car", "Pedestrian", "Cyclist"],
 
 	# 模型与推理
 	"device": "cuda:0" if torch.cuda.is_available() else "cpu",
@@ -136,15 +138,16 @@ def iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
 	bx1, by1, bx2, by2 = b
 	ix1, iy1 = max(ax1, bx1), max(ay1, by1)
 	ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-	iw, ih = max(0.0, ix2 - ix1 + 1), max(0.0, iy2 - iy1 + 1)
+	iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
 	inter = iw * ih
-	aa = max(0.0, ax2 - ax1 + 1) * max(0.0, ay2 - ay1 + 1)
-	ba = max(0.0, bx2 - bx1 + 1) * max(0.0, by2 - by1 + 1)
+	aa = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+	ba = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
 	union = aa + ba - inter + 1e-9
 	return float(inter / union)
 
 
-def load_kitti_sequences(root: str, split: str, sequences: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+def load_kitti_sequences(root: str, split: str, sequences: Optional[List[int]] = None,
+                        allowed_types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
 	assert split in ("training", "testing")
 	img_root = os.path.join(root, split, "image_02")
 	if not os.path.isdir(img_root):
@@ -161,7 +164,7 @@ def load_kitti_sequences(root: str, split: str, sequences: Optional[List[int]] =
 		labels = None
 		if split == "training":
 			label_file = os.path.join(root, split, "label_02", f"{sid:04d}.txt")
-			labels = parse_kitti_labels(label_file)
+			labels = parse_kitti_labels(label_file, allowed_types=allowed_types)
 		seqs.append({
 			"seq_id": sid,
 			"img_paths": img_paths,
@@ -170,12 +173,14 @@ def load_kitti_sequences(root: str, split: str, sequences: Optional[List[int]] =
 	return seqs
 
 
-def parse_kitti_labels(label_file: str) -> Dict[int, List[Box]]:
+def parse_kitti_labels(label_file: str, allowed_types: Optional[List[str]] = None) -> Dict[int, List[Box]]:
 	"""
 	KITTI tracking label_02 每行：
 	frame, track_id, type, truncated, occluded, alpha,
 	left, top, right, bottom, h, w, l, x, y, z, ry, score?
-	此处仅使用 frame 与 bbox；类别忽略（class-agnostic 评测）。
+	此处仅使用 frame 与 bbox；类别忽略（class-agnostic 评测），但会过滤不评测的类型：
+	- 若 allowed_types 提供，仅保留这些 type
+	- 总是忽略: 'DontCare', 'Misc'
 	"""
 	if not os.path.isfile(label_file):
 		raise FileNotFoundError(f"Missing label file: {label_file}")
@@ -186,6 +191,11 @@ def parse_kitti_labels(label_file: str) -> Dict[int, List[Box]]:
 			if len(parts) < 10:
 				continue
 			frame_id = int(parts[0])
+			typ = parts[2]
+			if typ in ("DontCare", "Misc"):
+				continue
+			if allowed_types is not None and typ not in allowed_types:
+				continue
 			left, top, right, bottom = map(float, parts[6:10])
 			b = Box(left, top, right, bottom, 1.0)
 			out.setdefault(frame_id, []).append(b)
@@ -491,7 +501,7 @@ def run_pipeline(mode: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
 	model = load_yolo(cfg["model_weights"], device, imgsz, cfg["conf_thres"], cfg["iou_nms"])
 	tracker = create_bytetracker(cfg["bytetrack"]) if mode == "system" else None
 
-	seqs = load_kitti_sequences(cfg["kitti_root"], cfg["split"], cfg["sequences"])
+	seqs = load_kitti_sequences(cfg["kitti_root"], cfg["split"], cfg["sequences"], cfg.get("kitti_types"))
 
 	# 评测器
 	evaluator = DetectionEvaluator(iou_thresh=cfg["iou_eval"])
