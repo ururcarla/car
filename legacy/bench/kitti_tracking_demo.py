@@ -64,7 +64,7 @@ CONFIG = {
 	# 指定序列列表；None 表示使用全部训练（或测试）序列
 	"sequences": None,  # 例: [0, 1, 2]
 	# 评测允许的 KITTI 类型（class-agnostic 但需排除 DontCare/Misc 等），可按需调整
-	"kitti_types": ["Car", "Pedestrian", "Cyclist"],
+	"kitti_types": ["Car", "Pedestrian", "Cyclist", "Truck", "Van", "Tram", "Person_sitting"],
 
 	# 模型与推理
 	"device": "cuda:0" if torch.cuda.is_available() else "cpu",
@@ -111,6 +111,7 @@ class Box:
 	x2: float
 	y2: float
 	score: float = 1.0
+	cls: Optional[str] = None
 
 	def as_xyxy(self) -> np.ndarray:
 		return np.array([self.x1, self.y1, self.x2, self.y2], dtype=np.float32)
@@ -197,7 +198,7 @@ def parse_kitti_labels(label_file: str, allowed_types: Optional[List[str]] = Non
 			if allowed_types is not None and typ not in allowed_types:
 				continue
 			left, top, right, bottom = map(float, parts[6:10])
-			b = Box(left, top, right, bottom, 1.0)
+			b = Box(left, top, right, bottom, 1.0, cls=typ)
 			out.setdefault(frame_id, []).append(b)
 	return out
 
@@ -432,6 +433,22 @@ def load_yolo(model_weights: str, device: str, imgsz: int, conf_thres: float, io
 	return model
 
 
+def map_coco_to_kitti(coco_name: str) -> Optional[str]:
+	"""
+	将 YOLO(COCO) 类别名称映射为 KITTI 评测类别，返回 None 表示不使用该预测。
+	默认仅保留 Car / Pedestrian / Cyclist 三类。
+	"""
+	name = coco_name.lower()
+	if name == "person":
+		return "Pedestrian"
+	if name in ("bicycle", "motorcycle"):
+		return "Cyclist"
+	if name == "car":
+		return "Car"
+	# 其他类别先忽略，避免引入噪声
+	return None
+
+
 def run_detect(model, image_bgr: np.ndarray) -> List[Box]:
 	"""
 	对单张图像做检测，返回 Box 列表（坐标基于输入图像尺寸）。
@@ -444,8 +461,25 @@ def run_detect(model, image_bgr: np.ndarray) -> List[Box]:
 	if res and res.boxes is not None and res.boxes.xyxy is not None:
 		xyxy = res.boxes.xyxy.detach().cpu().numpy()
 		scores = res.boxes.conf.detach().cpu().numpy() if res.boxes.conf is not None else np.ones((xyxy.shape[0],), dtype=np.float32)
-		for (x1, y1, x2, y2), sc in zip(xyxy, scores):
-			boxes.append(Box(float(x1), float(y1), float(x2), float(y2), float(sc)))
+		cls_ids = None
+		if getattr(res.boxes, "cls", None) is not None:
+			try:
+				cls_ids = res.boxes.cls.detach().cpu().numpy().astype(int)
+			except Exception:
+				cls_ids = None
+		names = getattr(res, "names", None)
+		for i, ((x1, y1, x2, y2), sc) in enumerate(zip(xyxy, scores)):
+			mapped_cls = None
+			if names is not None and cls_ids is not None:
+				cname = None
+				if isinstance(names, dict):
+					cname = names.get(int(cls_ids[i]), None)
+				if cname is not None:
+					mapped_cls = map_coco_to_kitti(str(cname))
+			# 仅保留映射到 KITTI 评测类的框
+			if mapped_cls is None:
+				continue
+			boxes.append(Box(float(x1), float(y1), float(x2), float(y2), float(sc), cls=mapped_cls))
 	return boxes
 
 
