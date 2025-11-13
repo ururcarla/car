@@ -458,23 +458,35 @@ def bytetrack_update(tracker: BYTETracker, dets: List[Box], img_wh: Tuple[int, i
 		dets_np = np.array([[d.x1, d.y1, d.x2, d.y2, d.score] for d in dets], dtype=np.float32)
 	img_w, img_h = img_wh
 
-	# 兼容 ultralytics 两种不同的 ByteTrack API：
-	# 1) update(results, img) 期望 Results 对象，读取 boxes.xyxy / boxes.conf
-	# 2) update(dets_np, img_info, img_size) 期望 Nx5 ndarray
+	# 兼容 ultralytics 不同版本 ByteTrack API：
+	# A) update(results, img) 期望 Results/Boxes（读取 boxes.xyxy / boxes.conf）
+	# B) update([results], img) 期望列表包裹
+	# C) update(dets_np, img_info, img_size) 期望 Nx5 ndarray（旧版）
 	try:
-		# 构造最小 Results/Boxes 适配器
+		# 构造最小 Results/Boxes 适配器（具备 .boxes.xyxy / .boxes.conf / .boxes.cls）
 		boxes_obj = SimpleNamespace(
 			xyxy=torch.from_numpy(dets_np[:, :4] if dets_np.size else np.zeros((0, 4), dtype=np.float32)),
 			conf=torch.from_numpy(dets_np[:, 4] if dets_np.size else np.zeros((0,), dtype=np.float32)),
+			cls=torch.zeros((dets_np.shape[0] if dets_np.size else 0,), dtype=torch.float32),
 		)
 		results_stub = SimpleNamespace(boxes=boxes_obj, orig_shape=(img_h, img_w))
 		dummy_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-		output_tracks = tracker.update([results_stub], dummy_img)  # type: ignore[arg-type]
-		return output_tracks
+		# 先尝试传入单个对象
+		return tracker.update(results_stub, dummy_img)  # type: ignore[arg-type]
 	except Exception:
-		# 回退到旧接口（Nx5 + img_info + img_size）
-		output_tracks = tracker.update(dets_np, [img_h, img_w], [img_h, img_w])
-		return output_tracks
+		try:
+			# 再尝试列表包裹
+			boxes_obj = SimpleNamespace(
+				xyxy=torch.from_numpy(dets_np[:, :4] if dets_np.size else np.zeros((0, 4), dtype=np.float32)),
+				conf=torch.from_numpy(dets_np[:, 4] if dets_np.size else np.zeros((0,), dtype=np.float32)),
+				cls=torch.zeros((dets_np.shape[0] if dets_np.size else 0,), dtype=torch.float32),
+			)
+			results_stub = SimpleNamespace(boxes=boxes_obj, orig_shape=(img_h, img_w))
+			dummy_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+			return tracker.update([results_stub], dummy_img)  # type: ignore[arg-type]
+		except Exception:
+			# 回退到旧接口（Nx5 + img_info + img_size）
+			return tracker.update(dets_np, [img_h, img_w], [img_h, img_w])
 
 
 # ==============================
