@@ -548,6 +548,62 @@ def run_bench_for_model(model_name: str,
     return records
 
 
+def run_bench_for_model_batch_ge(model_name: str,
+                                 few_groups: List[List[ImageROIs]],
+                                 many_groups: List[List[ImageROIs]],
+                                 imgsz: int,
+                                 batch_min: int) -> List[BenchRecord]:
+    """
+    在与原脚本相同的数据与分组上，追加仅针对 Batch 方法的“batch>=N”场景。
+    为了达到批量下限，将在需要时对ROI样本进行有放回重复，以构造至少 batch_min 的批次。
+    - 场景命名：few_ge{N} / many_ge{N}
+    - 方法命名仍为 "batch"（便于沿用CSV结构；绘图函数默认忽略额外场景，不影响现有功能）
+    """
+    if UL_YOLO is None:
+        raise RuntimeError("未安装 ultralytics，请先安装。")
+    model = UL_YOLO(model_name)
+    model.to("cuda")
+
+    def bench_scenario_batchmin(groups: List[List[ImageROIs]], scenario_label: str) -> BenchRecord:
+        if len(groups) == 0:
+            return BenchRecord(model=model_name, scenario=scenario_label, method="batch",
+                               infer_ms_mean=float("nan"), total_ms_mean=float("nan"), num_groups=0)
+        infer_ms_list, total_ms_list = [], []
+        for group in groups:
+            frames, rois = build_frames_and_rois(group)
+            # 打包ROI为小批次
+            t_pack0 = time.perf_counter()
+            roi_batch = build_batch_from_rois(frames, rois)  # [B,H,W,3]
+            # 达不到阈值时，重复采样填充
+            b = int(roi_batch.shape[0])
+            if b > 0 and b < batch_min:
+                need = batch_min - b
+                idx = np.random.choice(b, size=need, replace=True)
+                extra = roi_batch[idx]
+                roi_batch = np.concatenate([roi_batch, extra], axis=0)
+            t_pack1 = time.perf_counter()
+            if roi_batch.shape[0] > 0:
+                infer_ms, _ = time_predict_numpy(model, roi_batch, imgsz=ROI_BATCH_SIZE)
+            else:
+                infer_ms = 0.0
+            total_ms = infer_ms + (t_pack1 - t_pack0) * 1000.0
+            infer_ms_list.append(infer_ms)
+            total_ms_list.append(total_ms)
+        return BenchRecord(
+            model=model_name,
+            scenario=scenario_label,
+            method="batch",
+            infer_ms_mean=float(np.mean(infer_ms_list)) if infer_ms_list else float("nan"),
+            total_ms_mean=float(np.mean(total_ms_list)) if total_ms_list else float("nan"),
+            num_groups=len(groups),
+        )
+
+    recs: List[BenchRecord] = []
+    recs.append(bench_scenario_batchmin(few_groups, f"few_ge{int(batch_min)}"))
+    recs.append(bench_scenario_batchmin(many_groups, f"many_ge{int(batch_min)}"))
+    return recs
+
+
 def plot_results(records: List[BenchRecord], out_dir: Path, metric: str = "total_ms_mean"):
     if plt is None:
         return
@@ -621,6 +677,10 @@ def main():
         ], help="待评测的模型名称/权重路径")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out-dir", type=str, default="roi_bench_results")
+    ap.add_argument(
+        "--batch-min-ge", type=int, nargs="+", default=None,
+        help="追加一个或多个 batch>=N 的附加场景（仅对Batch方法生效，示例: --batch-min-ge 50 64）。"
+    )
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -662,6 +722,18 @@ def main():
         print(f"[bench] 模型: {m} 在 少/多ROI 上进行画布与批次基准测试...")
         recs = run_bench_for_model(m, few_groups, many_groups, imgsz=args.imgsz)
         all_records.extend(recs)
+        # 追加 batch>=N 的扩展场景（不影响默认绘图，仅写入CSV，场景名 few_geN/many_geN）
+        if args.batch_min_ge:
+            for ge in args.batch_min_ge:
+                try:
+                    ge_int = int(ge)
+                except Exception:
+                    continue
+                if ge_int <= 0:
+                    continue
+                print(f"[bench-extra] 模型: {m} 追加 Batch>= {ge_int} 场景...")
+                extra = run_bench_for_model_batch_ge(m, few_groups, many_groups, imgsz=args.imgsz, batch_min=ge_int)
+                all_records.extend(extra)
 
     # 输出CSV与图表
     out_csv = out_dir / "roi_canvas_vs_batch.csv"
