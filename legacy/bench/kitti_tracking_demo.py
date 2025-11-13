@@ -44,9 +44,15 @@ import matplotlib.pyplot as plt
 try:
 	from ultralytics import YOLO
 	from ultralytics.trackers.byte_tracker import BYTETracker
+	# 尝试导入官方 Results/Boxes 以最大兼容
+	try:
+		from ultralytics.yolo.engine.results import Results, Boxes  # type: ignore
+	except Exception:
+		Results, Boxes = None, None  # type: ignore
 except Exception as e:
 	YOLO = None
 	BYTETracker = None
+	Results, Boxes = None, None  # type: ignore
 	print("Warning: ultralytics not available. Please install `pip install ultralytics`. Error:", e)
 
 
@@ -458,35 +464,42 @@ def bytetrack_update(tracker: BYTETracker, dets: List[Box], img_wh: Tuple[int, i
 		dets_np = np.array([[d.x1, d.y1, d.x2, d.y2, d.score] for d in dets], dtype=np.float32)
 	img_w, img_h = img_wh
 
-	# 兼容 ultralytics 不同版本 ByteTrack API：
-	# A) update(results, img) 期望 Results/Boxes（读取 boxes.xyxy / boxes.conf）
-	# B) update([results], img) 期望列表包裹
-	# C) update(dets_np, img_info, img_size) 期望 Nx5 ndarray（旧版）
+	# 优先使用官方 Results/Boxes（ultralytics 新版 API），失败则回退到轻量适配，再不行使用旧 ndarray 接口
+	dummy_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+	# A) 官方 Results/Boxes
+	if 'Boxes' in globals() and Boxes is not None and 'Results' in globals() and Results is not None:
+		try:
+			if dets_np.size:
+				cls_col = np.zeros((dets_np.shape[0], 1), dtype=np.float32)  # 单类占位
+				data_np = np.concatenate([dets_np[:, :5], cls_col], axis=1)   # Nx6: xyxy+conf+cls
+			else:
+				data_np = np.zeros((0, 6), dtype=np.float32)
+			data_t = torch.from_numpy(data_np)
+			boxes_ultra = Boxes(data=data_t, orig_shape=(img_h, img_w))  # type: ignore[arg-type]
+			results_ultra = Results(orig_img=dummy_img, path=None, names=None, boxes=boxes_ultra)  # type: ignore[arg-type]
+			try:
+				return tracker.update(results_ultra, dummy_img)  # type: ignore[arg-type]
+			except Exception:
+				return tracker.update([results_ultra], dummy_img)  # type: ignore[arg-type]
+		except Exception:
+			pass
+
+	# B) 轻量适配器（具备 boxes.xyxy/conf/cls）
 	try:
-		# 构造最小 Results/Boxes 适配器（具备 .boxes.xyxy / .boxes.conf / .boxes.cls）
 		boxes_obj = SimpleNamespace(
 			xyxy=torch.from_numpy(dets_np[:, :4] if dets_np.size else np.zeros((0, 4), dtype=np.float32)),
 			conf=torch.from_numpy(dets_np[:, 4] if dets_np.size else np.zeros((0,), dtype=np.float32)),
 			cls=torch.zeros((dets_np.shape[0] if dets_np.size else 0,), dtype=torch.float32),
 		)
 		results_stub = SimpleNamespace(boxes=boxes_obj, orig_shape=(img_h, img_w))
-		dummy_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-		# 先尝试传入单个对象
-		return tracker.update(results_stub, dummy_img)  # type: ignore[arg-type]
-	except Exception:
 		try:
-			# 再尝试列表包裹
-			boxes_obj = SimpleNamespace(
-				xyxy=torch.from_numpy(dets_np[:, :4] if dets_np.size else np.zeros((0, 4), dtype=np.float32)),
-				conf=torch.from_numpy(dets_np[:, 4] if dets_np.size else np.zeros((0,), dtype=np.float32)),
-				cls=torch.zeros((dets_np.shape[0] if dets_np.size else 0,), dtype=torch.float32),
-			)
-			results_stub = SimpleNamespace(boxes=boxes_obj, orig_shape=(img_h, img_w))
-			dummy_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-			return tracker.update([results_stub], dummy_img)  # type: ignore[arg-type]
+			return tracker.update(results_stub, dummy_img)  # type: ignore[arg-type]
 		except Exception:
-			# 回退到旧接口（Nx5 + img_info + img_size）
-			return tracker.update(dets_np, [img_h, img_w], [img_h, img_w])
+			return tracker.update([results_stub], dummy_img)  # type: ignore[arg-type]
+	except Exception:
+		# C) 旧接口（Nx5 + img_info + img_size）
+		return tracker.update(dets_np, [img_h, img_w], [img_h, img_w])
 
 
 # ==============================
