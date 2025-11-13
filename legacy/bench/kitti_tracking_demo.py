@@ -53,6 +53,7 @@ except Exception as e:
 	sv = None
 	print("Warning: supervision not available. Please install `pip install supervision`. Error:", e)
 
+
 # ==============================
 # 可调参数（集中管理）
 # ==============================
@@ -441,36 +442,35 @@ def run_detect(model, image_bgr: np.ndarray) -> List[Box]:
 def create_bytetracker(cfg: Dict[str, Any]):
 	if sv is None:
 		raise RuntimeError("supervision not installed. Please `pip install supervision`.")
-	args = sv.ByteTrackArgs(
-		track_thresh=cfg.get("track_thresh", 0.5),
-		match_thresh=cfg.get("match_thresh", 0.8),
-		track_buffer=cfg.get("track_buffer", 30),
-		mot20=cfg.get("mot20", False),
-		# 使用默认 aspect_ratio_thresh 与 min_box_area
+	return sv.ByteTrack(
+		track_activation_threshold=float(cfg.get("track_thresh", 0.5)),
+		lost_track_buffer=int(cfg.get("track_buffer", 30)),
+		minimum_matching_threshold=float(cfg.get("match_thresh", 0.8)),
+		frame_rate=int(cfg.get("frame_rate", 30)),
+		minimum_consecutive_frames=int(cfg.get("min_consecutive", 1)),
 	)
-	return sv.ByteTrack(args)
 
 
 def bytetrack_update(tracker, dets: List[Box], img_wh: Tuple[int, int]):
 	"""
 	使用 supervision 的 ByteTrack：将 Box 列表转为 sv.Detections 并调用 update_with_detections。
 	"""
+	if sv is None:
+		return []
+
 	if len(dets) == 0:
 		xyxy = np.zeros((0, 4), dtype=np.float32)
 		conf = np.zeros((0,), dtype=np.float32)
 	else:
 		xyxy = np.array([[d.x1, d.y1, d.x2, d.y2] for d in dets], dtype=np.float32)
 		conf = np.array([d.score for d in dets], dtype=np.float32)
-
-	if sv is None:
-		return []
-
 	class_id = np.zeros((xyxy.shape[0],), dtype=int) if xyxy.shape[0] > 0 else np.zeros((0,), dtype=int)
 	detections = sv.Detections(xyxy=xyxy, confidence=conf, class_id=class_id)
 
 	try:
 		return tracker.update_with_detections(detections)
 	except Exception:
+		# 兼容旧版本 API（极少数版本用 update）
 		return tracker.update(detections)
 
 
